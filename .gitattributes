@@ -1,0 +1,42 @@
+# Auto-detect text files and normalize line endings to LF inside the
+# repository itself. This is a baseline only - the entries below force LF
+# on checkout too (regardless of platform or a contributor's local
+# core.autocrlf setting) for files that must have real Unix line endings
+# to function at all.
+* text=auto
+
+# --- Files that execute directly on the Ubuntu VPS via a shebang, or are
+#     parsed by Nginx/consumed as shell config. A CRLF-terminated shebang
+#     line ("#!/usr/bin/env bash\r") fails to exec on Linux, and a
+#     trailing \r can corrupt Nginx directive values. These must always
+#     check out with LF, even on a Windows contributor's machine. ---
+*.sh            text eol=lf
+m3u8-manager    text eol=lf
+install.sh      text eol=lf
+uninstall.sh    text eol=lf
+status.sh       text eol=lf
+*.template      text eol=lf
+*.conf          text eol=lf
+
+# --- Explicit binary types ---
+# None currently exist in this project (no images, fonts, or archives are
+# checked in), but these are declared defensively so Git never attempts a
+# text/EOL conversion on them if one is added later. HLS .ts segments are
+# NOT listed here - they are already excluded from the repository entirely
+# by path-scoped rules in .gitignore (hls/, web/hls/, etc.), so a global
+# binary rule would only cost future TypeScript .ts source files their
+# normal Git diffs for no actual benefit.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.eot   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.mp4   binary

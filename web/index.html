@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Livestream Player</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1 id="channel-title">Livestream</h1>
+  </header>
+
+  <main>
+    <div class="player-wrap">
+      <video id="video" controls playsinline autoplay muted></video>
+      <div id="overlay" class="overlay hidden">
+        <p id="overlay-message">Connecting...</p>
+        <button id="retry-btn" class="hidden">Retry</button>
+      </div>
+    </div>
+
+    <section id="channel-list-section" class="hidden">
+      <h2>Available Channels</h2>
+      <ul id="channel-list"></ul>
+    </section>
+  </main>
+
+  <footer>
+    <p>Powered by M3U8 Livestream Server</p>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+  <script src="/player.js"></script>
+</body>
+</html>

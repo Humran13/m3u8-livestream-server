@@ -1,0 +1,493 @@
+#!/usr/bin/env bash
+# m3u8-manager - interactive day-to-day administration tool for the
+# M3U8 Livestream Server. Installed as /usr/local/bin/m3u8-manager, but this
+# file is also runnable directly from the project checkout before install.
+
+set -Eeuo pipefail
+
+# Resolve the real directory of this script even when invoked through the
+# /usr/local/bin symlink created by install.sh.
+_m3u8_source="${BASH_SOURCE[0]}"
+while [ -h "$_m3u8_source" ]; do
+    _m3u8_dir="$(cd -P "$(dirname "$_m3u8_source")" && pwd)"
+    _m3u8_source="$(readlink "$_m3u8_source")"
+    [[ "$_m3u8_source" != /* ]] && _m3u8_source="${_m3u8_dir}/${_m3u8_source}"
+done
+M3U8_SCRIPT_DIR="$(cd -P "$(dirname "$_m3u8_source")" && pwd)"
+M3U8_PROJECT_ROOT="$M3U8_SCRIPT_DIR"
+
+# shellcheck source=lib/common.sh
+source "${M3U8_SCRIPT_DIR}/lib/common.sh"
+# shellcheck source=lib/osdetect.sh
+source "${M3U8_SCRIPT_DIR}/lib/osdetect.sh"
+# shellcheck source=lib/nginx.sh
+source "${M3U8_SCRIPT_DIR}/lib/nginx.sh"
+# shellcheck source=lib/streams.sh
+source "${M3U8_SCRIPT_DIR}/lib/streams.sh"
+# shellcheck source=lib/ssl.sh
+source "${M3U8_SCRIPT_DIR}/lib/ssl.sh"
+# shellcheck source=lib/firewall.sh
+source "${M3U8_SCRIPT_DIR}/lib/firewall.sh"
+# shellcheck source=lib/diagnostics.sh
+source "${M3U8_SCRIPT_DIR}/lib/diagnostics.sh"
+
+require_root "$@"
+
+pause() {
+    printf '\nPress Enter to continue...'
+    read -r _ </dev/tty || true
+}
+
+require_streams_or_notice() {
+    local names
+    names="$(list_stream_names || true)"
+    if [ -z "$names" ]; then
+        log_info 'No channels are configured yet. Use "Add Stream / Channel" first.'
+        return 1
+    fi
+    printf '%s' "$names"
+    return 0
+}
+
+pick_stream() {
+    local names name i=1 choice
+    names="$(require_streams_or_notice)" || return 1
+    {
+        printf 'Channels:\n'
+        while IFS= read -r name; do
+            printf '  %d. %s\n' "$i" "$name"
+            i=$((i + 1))
+        done <<<"$names"
+    } >&2
+    choice="$(ask "Select a channel by number" "1")"
+    name="$(printf '%s\n' "$names" | sed -n "${choice}p")"
+    [ -n "$name" ] || { log_error "Invalid selection."; return 1; }
+    printf '%s' "$name"
+}
+
+# ---------------------------------------------------------------------------
+# Menu actions
+# ---------------------------------------------------------------------------
+show_status() {
+    print_banner "SERVER STATUS"
+    printf 'OS: %s\n' "${OS_PRETTY_NAME:-unknown}"
+    printf 'Hostname: %s\n' "$(hostname)"
+    printf 'Nginx running: %s\n' "$(nginx_is_running && echo yes || echo no)"
+    printf 'RTMP port %s listening: %s\n' "$M3U8_RTMP_PORT" "$(port_listening "$M3U8_RTMP_PORT" && echo yes || echo no)"
+    printf 'HTTP port 80 listening: %s\n' "$(port_listening 80 && echo yes || echo no)"
+    printf 'HTTPS port 443 listening: %s\n' "$(port_listening 443 && echo yes || echo no)"
+    printf 'SSL enabled: %s\n' "$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED 2>/dev/null || echo false)"
+    printf 'HLS directory: %s\n' "$M3U8_HLS_DIR"
+    local live_count
+    live_count="$(find "$M3U8_HLS_DIR" -maxdepth 1 -name '*.m3u8' 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'Active HLS playlists: %s\n' "$live_count"
+    local stream_count
+    stream_count="$(find "$M3U8_STREAMS_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'Configured channels: %s\n' "$stream_count"
+    printf 'Disk usage (web root): %s\n' "$(df -h "$M3U8_WEB_ROOT" 2>/dev/null | awk 'NR==2{print $5" used"}')"
+    printf 'Firewall: '
+    if ufw_installed; then ufw_is_active && printf 'active\n' || printf 'installed, inactive\n'; else printf 'not installed\n'; fi
+}
+
+add_stream_menu() {
+    print_banner "ADD STREAM / CHANNEL"
+    local name display key
+    while :; do
+        name="$(ask "Channel name (lowercase, no spaces)" "")"
+        if ! is_valid_channel_name "$name"; then
+            log_error "Invalid name. Use lowercase letters, digits, - or _ (2-32 chars); not a reserved word."
+            continue
+        fi
+        if stream_exists "$name"; then
+            log_error "A channel named '$name' already exists."
+            continue
+        fi
+        break
+    done
+    display="$(ask "Display name" "$name")"
+    if confirm "Automatically generate a secure stream key?" "y"; then
+        key="$(generate_stream_key)"
+    else
+        key="$(ask "Enter a stream key" "")"
+        [ -n "$key" ] || die "A stream key is required."
+    fi
+    add_stream "$name" "$display" "$key" "true"
+    printf '\nChannel:\n%s\n\n' "$name"
+    printf 'OBS Server:\n'
+    printf 'rtmp://%s/%s\n\n' "$(conf_get "$M3U8_SERVER_CONF" DOMAIN)" "$(conf_get "$M3U8_SERVER_CONF" RTMP_APP)"
+    printf 'Stream Key:\n%s\n\n' "$key"
+    printf 'M3U8 URL:\n%s\n\n' "$(hls_url_for "$name")"
+    printf 'Player:\n%s\n' "$(player_url_for "$name")"
+}
+
+remove_stream_menu() {
+    print_banner "REMOVE STREAM / CHANNEL"
+    local name purge
+    name="$(pick_stream)" || return 0
+    printf '\nAbout to remove channel: %s\n' "$name"
+    printf 'This will stop the stream key from working and remove it from the manager.\n'
+    confirm "Also delete this channel's HLS files on disk?" "n" && purge="true" || purge="false"
+    if confirm "Type 'y' to confirm permanent removal of '$name'" "n"; then
+        remove_stream "$name" "$purge"
+    else
+        log_info "Removal cancelled."
+    fi
+}
+
+list_streams_menu() {
+    print_banner "STREAMS / CHANNELS"
+    local names name
+    names="$(require_streams_or_notice)" || return 0
+    printf '%-20s %-24s %-10s %s\n' "NAME" "DISPLAY" "ENABLED" "HLS"
+    while IFS= read -r name; do
+        print_stream_summary_line "$name"
+    done <<<"$names"
+}
+
+show_stream_details_menu() {
+    print_banner "STREAM DETAILS"
+    local name
+    name="$(pick_stream)" || return 0
+    printf '\nChannel: %s\n' "$name"
+    printf 'Display name: %s\n' "$(get_stream_field "$name" DISPLAY_NAME)"
+    printf 'Enabled: %s\n' "$(get_stream_field "$name" ENABLED)"
+    printf 'Created: %s\n' "$(get_stream_field "$name" CREATED_AT)"
+    printf 'RTMP server: rtmp://%s/%s\n' "$(conf_get "$M3U8_SERVER_CONF" DOMAIN)" "$(conf_get "$M3U8_SERVER_CONF" RTMP_APP)"
+    printf 'HLS URL: %s\n' "$(hls_url_for "$name")"
+    printf 'Player URL: %s\n' "$(player_url_for "$name")"
+    printf 'Config file: %s\n' "$(stream_file "$name")"
+    if confirm "Show the stream key?" "n"; then
+        printf 'Stream Key: %s\n' "$(get_stream_field "$name" STREAM_KEY)"
+    fi
+}
+
+show_obs_settings_menu() {
+    print_banner "OBS SETTINGS"
+    local name
+    name="$(pick_stream)" || return 0
+    printf '\n'
+    print_obs_settings "$name"
+}
+
+show_m3u8_url_menu() {
+    print_banner "M3U8 URL"
+    local name url key
+    name="$(pick_stream)" || return 0
+    url="$(hls_url_for "$name")"
+    key="$(get_stream_field "$name" STREAM_KEY)"
+    printf '\n%s\n\n' "$url"
+    if [ -f "${M3U8_HLS_DIR}/${key}.m3u8" ]; then
+        printf 'Playlist status: currently exists (stream appears live)\n'
+    else
+        printf 'Playlist status: does not exist yet (stream is offline)\n'
+    fi
+}
+
+show_player_url_menu() {
+    print_banner "WEB PLAYER URL"
+    local name
+    name="$(pick_stream)" || return 0
+    printf '\n%s\n' "$(player_url_for "$name")"
+}
+
+regenerate_key_menu() {
+    print_banner "REGENERATE STREAM KEY"
+    local name new_key
+    name="$(pick_stream)" || return 0
+    log_warn "The current stream key for '$name' will stop working immediately."
+    log_warn "Any encoder still using the old key will be disconnected."
+    if confirm "Regenerate the stream key for '$name'?" "n"; then
+        new_key="$(regenerate_stream_key "$name")"
+        printf '\nNew OBS settings:\n\n'
+        print_obs_settings "$name"
+    else
+        log_info "Cancelled."
+    fi
+}
+
+enable_stream_menu() {
+    print_banner "ENABLE STREAM / CHANNEL"
+    local name
+    name="$(pick_stream)" || return 0
+    enable_stream "$name"
+    log_ok "Channel '$name' enabled."
+}
+
+disable_stream_menu() {
+    print_banner "DISABLE STREAM / CHANNEL"
+    local name
+    name="$(pick_stream)" || return 0
+    disable_stream "$name"
+    log_ok "Channel '$name' disabled."
+}
+
+test_nginx_menu() {
+    print_banner "TEST NGINX CONFIGURATION"
+    if test_nginx; then
+        log_ok "Nginx configuration is valid."
+    else
+        log_error "Nginx configuration test failed (see above)."
+    fi
+}
+
+reload_nginx_menu() {
+    print_banner "RELOAD NGINX"
+    reload_nginx || true
+}
+
+restart_nginx_menu() {
+    print_banner "RESTART NGINX"
+    log_warn "Active connections may be briefly interrupted."
+    if confirm "Continue?" "y"; then
+        restart_nginx || true
+        nginx_is_running && log_ok "Nginx is running." || log_error "Nginx is not running."
+    fi
+}
+
+view_logs_menu() {
+    print_banner "VIEW LOGS"
+    printf '1. Last 50 nginx error log entries\n'
+    printf '2. Follow nginx error log (Ctrl+C to stop)\n'
+    printf '3. Last 50 nginx access log entries\n'
+    printf '4. systemd journal for nginx\n'
+    printf '0. Back\n'
+    case "$(ask "Choice" "0")" in
+        1) tail -n 50 /var/log/nginx/error.log 2>/dev/null || log_error "Log file not found." ;;
+        2) tail -f /var/log/nginx/error.log ;;
+        3) tail -n 50 /var/log/nginx/access.log 2>/dev/null || log_error "Log file not found." ;;
+        4) journalctl -u nginx -n 100 --no-pager ;;
+        *) ;;
+    esac
+}
+
+check_hls_menu() {
+    print_banner "HLS SEGMENTS"
+    printf 'HLS directory: %s\n' "$M3U8_HLS_DIR"
+    if [ ! -d "$M3U8_HLS_DIR" ]; then
+        log_error "HLS directory does not exist."
+        return 0
+    fi
+    printf 'Disk usage: %s\n\n' "$(du -sh "$M3U8_HLS_DIR" 2>/dev/null | awk '{print $1}')"
+    local name key playlist newest count
+    local names
+    names="$(list_stream_names || true)"
+    printf '%-20s %-10s %-10s %s\n' "CHANNEL" "STATE" "SEGMENTS" "NEWEST SEGMENT"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        key="$(get_stream_field "$name" STREAM_KEY)"
+        playlist="${M3U8_HLS_DIR}/${key}.m3u8"
+        count="$(find "$M3U8_HLS_DIR" -maxdepth 1 -name "${key}-*.ts" 2>/dev/null | wc -l | tr -d ' ')"
+        newest="$(find "$M3U8_HLS_DIR" -maxdepth 1 -name "${key}-*.ts" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n1 | awk '{print $2}')"
+        if [ -f "$playlist" ]; then
+            printf '%-20s %-10s %-10s %s\n' "$name" "live" "$count" "${newest:-none}"
+        else
+            printf '%-20s %-10s %-10s %s\n' "$name" "offline" "$count" "${newest:-none}"
+        fi
+    done <<<"$names"
+}
+
+ssl_menu() {
+    print_banner "SSL MANAGEMENT"
+    local domain email
+    domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN)"
+    email="$(conf_get "$M3U8_SERVER_CONF" ADMIN_EMAIL)"
+    printf '1. SSL Status\n2. Certificate Details\n3. Renew Certificate\n4. Test Renewal\n5. Configure SSL if missing\n0. Back\n'
+    case "$(ask "Choice" "0")" in
+        1) ssl_status_report "$domain" ;;
+        2) openssl x509 -in "$(cert_path_for "$domain")" -noout -text 2>/dev/null || log_error "No certificate found." ;;
+        3) renew_certificate || log_error "Certificate renewal failed or no certificate is configured yet." ;;
+        4) test_certificate_renewal || log_error "Renewal dry-run failed or no certificate is configured yet." ;;
+        5)
+            if certificate_exists "$domain"; then
+                log_info "A certificate already exists for $domain."
+            else
+                install_certbot
+                if obtain_certificate "$domain" "$email"; then
+                    write_http_conf "$domain" "true" "$(cert_path_for "$domain")" "$(key_path_for "$domain")"
+                    if test_nginx; then
+                        systemctl reload nginx
+                        conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "true"
+                        sync_channels_json "$domain" "true"
+                        log_ok "SSL configured."
+                    else
+                        log_error "New SSL config failed validation; leaving current configuration in place."
+                    fi
+                fi
+            fi
+            ;;
+        *) ;;
+    esac
+}
+
+firewall_status_menu() {
+    print_banner "FIREWALL STATUS"
+    firewall_status_report
+}
+
+backup_config_menu() {
+    print_banner "BACKUP CONFIGURATION"
+    local ts dest
+    ts="$(date '+%Y%m%d%H%M%S')"
+    ensure_dir "$M3U8_BACKUP_DIR" 700 root:root
+    dest="${M3U8_BACKUP_DIR}/backup-${ts}.tar.gz"
+    tar -czf "$dest" -C / \
+        --exclude="${M3U8_BACKUP_DIR#/}" \
+        "${M3U8_CONFIG_DIR#/}" \
+        "${M3U8_NGINX_SITE_FILE#/}" \
+        "${M3U8_NGINX_RTMP_CONF#/}" \
+        2>/dev/null || true
+    chmod 600 "$dest"
+    log_ok "Backup created: $dest"
+}
+
+restore_config_menu() {
+    print_banner "RESTORE CONFIGURATION"
+    local backups i=1 choice file
+    ensure_dir "$M3U8_BACKUP_DIR" 700 root:root
+    backups="$(find "$M3U8_BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' 2>/dev/null | sort -r)"
+    if [ -z "$backups" ]; then
+        log_info "No backups found in $M3U8_BACKUP_DIR"
+        return 0
+    fi
+    printf 'Available backups:\n'
+    while IFS= read -r file; do
+        printf '  %d. %s\n' "$i" "$(basename "$file")"
+        i=$((i + 1))
+    done <<<"$backups"
+    choice="$(ask "Select a backup to restore by number" "")"
+    file="$(printf '%s\n' "$backups" | sed -n "${choice}p")"
+    [ -n "$file" ] || { log_error "Invalid selection."; return 0; }
+    log_warn "Restoring will overwrite the current configuration in $M3U8_CONFIG_DIR and the generated nginx files."
+    confirm "A safety backup of the CURRENT configuration will be made first. Continue?" "n" || { log_info "Cancelled."; return 0; }
+    backup_config_menu
+    tar -xzf "$file" -C /
+    local domain ssl_enabled
+    domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN 2>/dev/null || echo "")"
+    ssl_enabled="$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED 2>/dev/null || echo "false")"
+    regenerate_streamkeys_map
+    [ -n "$domain" ] && sync_channels_json "$domain" "$ssl_enabled"
+    if reload_nginx; then
+        log_ok "Configuration restored and nginx reloaded."
+    else
+        log_error "Restored configuration failed nginx validation. The previous working configuration is still active; review the restored files manually."
+    fi
+}
+
+installation_summary_menu() {
+    print_banner "M3U8 SERVER INFORMATION"
+    printf 'Domain:\n%s\n\n' "$(conf_get "$M3U8_SERVER_CONF" DOMAIN)"
+    printf 'RTMP Server:\nrtmp://%s/%s\n\n' "$(conf_get "$M3U8_SERVER_CONF" DOMAIN)" "$(conf_get "$M3U8_SERVER_CONF" RTMP_APP)"
+    printf 'Web Player:\n%s://%s/\n\n' "$([ "$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED)" = "true" ] && echo https || echo http)" "$(conf_get "$M3U8_SERVER_CONF" DOMAIN)"
+    printf 'Configured Channels:\n%s\n\n' "$(find "$M3U8_STREAMS_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'SSL:\n%s\n\n' "$([ "$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED)" = "true" ] && echo Active || echo Disabled)"
+    printf 'Nginx:\n%s\n\n' "$(nginx_is_running && echo Running || echo Stopped)"
+    printf 'Manager:\nsudo m3u8-manager\n\n'
+    printf 'Main Configuration:\n%s\n\n' "$M3U8_SERVER_CONF"
+    printf 'HLS Directory:\n%s\n' "$M3U8_HLS_DIR"
+}
+
+diagnostics_menu() {
+    print_banner "SERVER DIAGNOSTICS"
+    run_diagnostics
+}
+
+project_info_menu() {
+    print_banner "PROJECT INFORMATION"
+    printf 'Project: %s\n' "$M3U8_PROJECT_NAME"
+    printf 'Version: %s\n' "$(cat "${M3U8_INSTALL_DIR}/VERSION" 2>/dev/null || cat "${M3U8_PROJECT_ROOT}/VERSION" 2>/dev/null || echo unknown)"
+    printf 'Config directory: %s\n' "$M3U8_CONFIG_DIR"
+    printf 'Install directory: %s\n' "$M3U8_INSTALL_DIR"
+    printf 'Repository: (set your GitHub repository URL here after publishing)\n'
+    printf 'Supported Ubuntu versions: %s\n' "${M3U8_SUPPORTED_UBUNTU[*]}"
+}
+
+uninstall_menu() {
+    print_banner "UNINSTALL SERVER"
+    log_warn "Uninstalling removes this project's nginx configuration, manager command,"
+    log_warn "and optionally its HLS files, backups and certificates. This cannot be undone."
+    if confirm "Run the uninstaller now?" "n"; then
+        if [ -x "${M3U8_INSTALL_DIR}/uninstall.sh" ]; then
+            exec "${M3U8_INSTALL_DIR}/uninstall.sh"
+        else
+            exec "${M3U8_PROJECT_ROOT}/uninstall.sh"
+        fi
+    else
+        log_info "Uninstall cancelled."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Menu loop
+# ---------------------------------------------------------------------------
+show_menu() {
+    print_banner "       M3U8 Livestream Manager"
+    cat <<'EOF'
+ 1. Server Status
+ 2. Add Stream / Channel
+ 3. Remove Stream / Channel
+ 4. List Streams / Channels
+ 5. Show Stream Details
+ 6. Show OBS Settings
+ 7. Show M3U8 URL
+ 8. Show Web Player URL
+ 9. Regenerate Stream Key
+10. Enable Stream
+11. Disable Stream
+12. Test Nginx Configuration
+13. Reload Nginx
+14. Restart Nginx
+15. View Logs
+16. Check HLS Segments
+17. SSL Management
+18. Firewall Status
+19. Backup Configuration
+20. Restore Configuration
+21. Installation Summary
+22. Server Diagnostics
+23. Project Information
+24. Uninstall Server
+ 0. Exit
+EOF
+}
+
+main() {
+    detect_os
+    local choice
+    while :; do
+        printf '\n'
+        show_menu
+        choice="$(ask "Select an option" "0")"
+        printf '\n'
+        case "$choice" in
+            1) show_status ;;
+            2) add_stream_menu ;;
+            3) remove_stream_menu ;;
+            4) list_streams_menu ;;
+            5) show_stream_details_menu ;;
+            6) show_obs_settings_menu ;;
+            7) show_m3u8_url_menu ;;
+            8) show_player_url_menu ;;
+            9) regenerate_key_menu ;;
+            10) enable_stream_menu ;;
+            11) disable_stream_menu ;;
+            12) test_nginx_menu ;;
+            13) reload_nginx_menu ;;
+            14) restart_nginx_menu ;;
+            15) view_logs_menu ;;
+            16) check_hls_menu ;;
+            17) ssl_menu ;;
+            18) firewall_status_menu ;;
+            19) backup_config_menu ;;
+            20) restore_config_menu ;;
+            21) installation_summary_menu ;;
+            22) diagnostics_menu ;;
+            23) project_info_menu ;;
+            24) uninstall_menu ;;
+            0) log_info "Goodbye."; exit 0 ;;
+            *) log_error "Invalid option." ;;
+        esac
+        pause
+    done
+}
+
+main "$@"
