@@ -26,6 +26,8 @@ source "${M3U8_SCRIPT_DIR}/lib/nginx.sh"
 source "${M3U8_SCRIPT_DIR}/lib/ssl.sh"
 # shellcheck source=lib/firewall.sh
 source "${M3U8_SCRIPT_DIR}/lib/firewall.sh"
+# shellcheck source=lib/relay.sh
+source "${M3U8_SCRIPT_DIR}/lib/relay.sh"
 # shellcheck source=lib/diagnostics.sh
 source "${M3U8_SCRIPT_DIR}/lib/diagnostics.sh"
 # shellcheck source=lib/selftest.sh

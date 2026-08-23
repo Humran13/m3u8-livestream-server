@@ -36,6 +36,11 @@ channel.
 - Configuration backup and restore
 - Conservative, confirmation-heavy uninstaller that only removes what this
   project created
+- Active self-tests: an end-to-end RTMP publish test and a relay test that
+  exercise the real pipeline, not just the configuration
+- 24/7 source relay: republish a local file, remote HLS/RTMP/RTMPS/RTSP, or
+  HTTP media source as this server's own stable HLS output, stream-copied
+  by default (no re-encoding) and supervised by systemd
 
 ## Requirements
 
@@ -54,6 +59,8 @@ channel.
   or higher bitrates
 - **Ports**: 22 (or your custom SSH port), 80, 443, and 1935 reachable from
   the internet (see [Firewall](#firewall))
+- **FFmpeg** is installed automatically - required for the relay subsystem
+  and the self-tests; RTMP publish/HLS itself does not depend on it
 
 ## Installation
 
@@ -153,6 +160,9 @@ sudo m3u8-manager
 | 22 | Server Diagnostics | PASS/WARNING/FAIL health report |
 | 23 | Project Information | Version, paths, supported OS list |
 | 24 | Uninstall Server | Hands off to `uninstall.sh` after confirmation |
+| 25 | RTMP Authentication Diagnostics | Shows/toggles publish auth mode, runs the auth self-test |
+| 26 | Run End-to-End Streaming Test | Publishes a real synthetic stream through the whole pipeline |
+| 27 | Relay Management | 24/7 source relay submenu - see below |
 
 ## Adding a Stream
 
@@ -165,6 +175,88 @@ safe, validated reload happens automatically.
 `m3u8-manager` → **3. Remove Stream / Channel**. You will be shown exactly
 what is being removed and asked to confirm before anything is deleted; HLS
 file cleanup is a separate, optional confirmation.
+
+## 24/7 Source Relay
+
+A relay takes an existing media source and republishes it as this server's
+own stable HLS output - separate from, and running alongside, the
+RTMP-publish channels above:
+
+```text
+Existing source (file, remote HLS, RTMP/RTMPS, RTSP, HTTP media)
+        ↓
+M3U8 Server Relay (systemd-supervised)
+        ↓
+https://stream.example.com/hls/relay/<name>/index.m3u8
+```
+
+`sudo m3u8-manager` → **27. Relay Management** → **1. Add Relay**, then
+answer:
+
+```text
+Relay name: mychannel
+Source: /path/to/video.mp4
+Loop forever: Yes
+Mode: Source Copy
+Start automatically: Yes
+```
+
+### Why Stream Copy
+
+The default output mode is **Source Copy**: FFmpeg repackages the
+already-encoded audio/video packets into HLS without decoding and
+re-encoding them (`-c:v copy -c:a copy`). For a compatible source (H.264 +
+AAC), this means CPU usage stays low regardless of resolution - the server
+is limited by bandwidth and disk I/O, not by video encoding. Re-encoding is
+never done automatically; it's an explicit, confirmed fallback
+("Compatibility Transcode") only offered when the source codec genuinely
+isn't HLS/browser-compatible.
+
+### Relay capability vs transcoding capability - these are different
+
+**Relaying (stream copy) 1080p/1440p/4K is usually network-bound** - a
+small VPS can often relay a 4K source it could never transcode.
+**Transcoding** is CPU-intensive real-time video encoding and is a
+completely different workload; do not assume a VPS that can relay 4K can
+also transcode it. Use **27 → 15. Estimate Bandwidth** to check whether
+your VPS's network capacity can support your expected viewer count before
+relying on this for production traffic.
+
+### Local Video Loop (24/7)
+
+`m3u8-manager` → **27 → 1. Add Relay**, source type **Local file**, point
+it at an uploaded video, say Yes to looping. The file replays indefinitely
+until the relay is stopped.
+
+### Remote HLS / RTMP / RTSP Relay
+
+Same flow, choosing the matching source type and pasting the source URL.
+For a remote **static** file you intend to loop, the manager offers to
+download and cache it locally first, rather than re-fetching it from the
+remote server on every loop.
+
+### Auto-Reconnect
+
+Each relay runs as its own systemd service (`m3u8-relay@<name>.service`,
+`Restart=on-failure`, rate-limited to avoid restart storms), as an
+unprivileged user - never root. HTTP/HLS sources use FFmpeg's own
+reconnect options; RTMP/RTSP sources reconnect by having systemd restart
+the whole relay process if the source drops.
+
+### Source URL Privacy
+
+A relay's source URL can contain credentials or private tokens. It is
+never written to any public file (the public manifest only ever contains
+the channel name, status, and public playback URL), and the manager
+redacts it in status/list output by default.
+
+### Resource Requirements
+
+Outbound bandwidth scales with `source bitrate × concurrent viewers`. A 20
+Mbps 4K source with 20 direct viewers needs roughly 400 Mbps outbound -
+check this with the bandwidth estimator (**27 → 15**) before assuming a
+given VPS can serve your expected audience. A CDN/reverse-proxy cache in
+front of this server changes that model significantly.
 
 ## M3U8 URLs
 
@@ -264,7 +356,9 @@ uninstall.sh         Conservative uninstaller
 status.sh            Non-interactive status/diagnostics report
 m3u8-manager         Interactive administration menu
 config/nginx/        Nginx configuration templates (rendered at install time)
-lib/                 Shared Bash libraries (common, streams, nginx, ssl, firewall, diagnostics)
+config/systemd/      Relay systemd template unit (rendered at install time)
+lib/                 Shared Bash libraries (common, streams, nginx, ssl, firewall,
+                     diagnostics, selftest, relay, relay-runner)
 web/                 Static web player (hls.js, no framework)
 docs/                Troubleshooting guide
 ```
@@ -291,7 +385,7 @@ the installer contains logic for it.
 | 18.04  | Yes                | No                |
 | 20.04  | Yes                | No                |
 | 22.04  | Yes                | No                |
-| 24.04  | Yes                | In progress - see below |
+| 24.04  | Yes                | Phase A passed; Phase B pending - see below |
 | 26.04  | Yes                | No                |
 
 ## Testing status
@@ -301,8 +395,11 @@ syntax-checked (`bash -n`), and the generated Nginx configuration has been
 reviewed for correctness against the Nginx and nginx-rtmp-module
 documentation.
 
-A real install has been attempted on **Ubuntu 24.04.4 LTS (x86_64, Nginx
-1.24.0)**. That attempt surfaced two real bugs, both now fixed:
+**Phase A (core RTMP publish → HLS pipeline) has passed a real VPS test**
+on **Ubuntu 24.04.4 LTS (x86_64, Nginx 1.24.0)**: OBS successfully
+published over RTMP, authenticated against a real stream key, and produced
+HLS output that played back correctly in VLC. Getting there surfaced three
+real, now-fixed bugs along the way:
 
 1. The generated SSL configuration used the standalone `http2 on;`
    directive, which does not exist before Nginx 1.25.1 - Nginx 1.24.0
@@ -311,23 +408,36 @@ A real install has been attempted on **Ubuntu 24.04.4 LTS (x86_64, Nginx
    version supports, rather than assuming one syntax for all releases.
 2. Firewall setup crashed with `ufw: command not found` even though the
    installer had already attempted to install it - a stale dpkg record
-   (package present in the dpkg database but not actually installed, e.g.
-   `deinstall ok config-files`) made the installer believe `ufw` was
-   already there. Package-presence checks across the whole project now
-   verify actual command availability, not just dpkg database state, and a
-   firewall setup failure no longer aborts the rest of the installation.
+   (package present in the dpkg database but not actually installed) made
+   the installer believe `ufw` was already there. Package-presence checks
+   across the whole project now verify actual command availability, not
+   just dpkg database state, and a firewall setup failure no longer aborts
+   the rest of the installation.
+3. RTMP publish authentication never actually worked: `on_publish` was
+   configured with a manually-interpolated `?name=$name` query string,
+   but nginx-rtmp's notify module does not substitute variables into that
+   URL - it's parsed once, statically, at config load. Every publish
+   attempt was rejected regardless of key. Fixed by using
+   `notify_method get;` so nginx-rtmp appends the real stream name as an
+   actual query parameter itself.
 
 The installer was also made safe to rerun against a partially-completed
-install left in that exact state (Nginx/RTMP/HTTP working, certificate
-issued, SSL config broken, firewall never configured) - rerunning
-`install.sh` now repairs the SSL config, reuses the existing certificate
-without requesting a new one, installs `ufw` if it's genuinely missing, and
-leaves any already-created channel and its stream key untouched.
+install (Nginx/RTMP/HTTP working, certificate issued, SSL config broken,
+firewall never configured) - rerunning `install.sh` repairs the SSL
+config, reuses the existing certificate without requesting a new one,
+installs `ufw` if it's genuinely missing, and leaves any already-created
+channel and its stream key untouched.
 
-**This has not yet been confirmed as a full, clean end-to-end pass** (fresh
-VPS, OBS publishing, HLS playback, VLC, web player, second channel,
-disable/enable, key rotation, backup/restore, uninstall). Ubuntu
-18.04/20.04/22.04/26.04 have received no real VPS testing at all - only
-static review and the version-detection logic described above, which is
-specifically designed not to assume a fixed Nginx/package version per
-release. Please report any issues you hit during real-world deployment.
+**Phase B (24/7 source relay) is brand new and has NOT been tested on a
+real VPS yet** - only statically reviewed and syntax-checked, same as
+everything above was before its own real test. Do not rely on relay mode
+in production until that testing has happened.
+
+Beyond the specific items above, this has not yet been confirmed as a
+full, clean end-to-end pass of every feature (second channel,
+disable/enable, key rotation, backup/restore, relay of each source type,
+uninstall). Ubuntu 18.04/20.04/22.04/26.04 have received no real VPS
+testing at all - only static review and the version-detection logic
+described above, which is specifically designed not to assume a fixed
+Nginx/package version per release. Please report any issues you hit
+during real-world deployment.

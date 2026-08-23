@@ -32,15 +32,28 @@
     return match ? match[1] : null;
   }
 
-  function fetchChannels() {
-    return fetch("/channels.generated.json", { cache: "no-store" })
+  function fetchJsonList(url) {
+    return fetch(url, { cache: "no-store" })
       .then(function (res) {
-        if (!res.ok) throw new Error("channels.generated.json returned " + res.status);
+        if (!res.ok) throw new Error(url + " returned " + res.status);
         return res.json();
       })
       .catch(function () {
         return [];
       });
+  }
+
+  // Merges live RTMP-publish channels and Phase B relays into one list.
+  // Relay entries include a "status" field (HEALTHY/STALE/OFFLINE/...);
+  // publish channels don't carry a live status here, so it's left
+  // undefined and simply not shown for them.
+  function fetchChannels() {
+    return Promise.all([
+      fetchJsonList("/channels.generated.json"),
+      fetchJsonList("/relays.generated.json")
+    ]).then(function (results) {
+      return (results[0] || []).concat(results[1] || []);
+    });
   }
 
   function renderChannelList(channels) {
@@ -50,6 +63,9 @@
       var a = document.createElement("a");
       a.href = "/watch/" + encodeURIComponent(ch.name);
       a.textContent = ch.displayName || ch.name;
+      if (ch.status && ch.status !== "HEALTHY") {
+        a.textContent += " (" + ch.status.toLowerCase() + ")";
+      }
       li.appendChild(a);
       listEl.appendChild(li);
     });

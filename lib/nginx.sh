@@ -38,21 +38,6 @@ nginx_supports_standalone_http2() {
     version_ge "$NGINX_VERSION" "1.25.1"
 }
 
-# render_template <template_file> <dest_file> <mode> "KEY=value" ...
-# Simple __KEY__ substitution using bash string replacement, so paths and
-# URLs containing '/' never break a sed delimiter.
-render_template() {
-    local template="$1" dest="$2" mode="$3"; shift 3
-    local content pair key value
-    content="$(cat "$template")"
-    for pair in "$@"; do
-        key="${pair%%=*}"
-        value="${pair#*=}"
-        content="${content//__${key}__/${value}}"
-    done
-    printf '%s\n' "$content" | atomic_write "$dest" "$mode"
-}
-
 install_nginx_rtmp() {
     log_info "Installing nginx and the RTMP module..."
     ensure_command nginx nginx \

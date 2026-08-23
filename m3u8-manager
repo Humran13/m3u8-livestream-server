@@ -28,6 +28,8 @@ source "${M3U8_SCRIPT_DIR}/lib/streams.sh"
 source "${M3U8_SCRIPT_DIR}/lib/ssl.sh"
 # shellcheck source=lib/firewall.sh
 source "${M3U8_SCRIPT_DIR}/lib/firewall.sh"
+# shellcheck source=lib/relay.sh
+source "${M3U8_SCRIPT_DIR}/lib/relay.sh"
 # shellcheck source=lib/diagnostics.sh
 source "${M3U8_SCRIPT_DIR}/lib/diagnostics.sh"
 # shellcheck source=lib/selftest.sh
@@ -62,6 +64,26 @@ pick_stream() {
         done <<<"$names"
     } >&2
     choice="$(ask "Select a channel by number" "1")"
+    name="$(printf '%s\n' "$names" | sed -n "${choice}p")"
+    [ -n "$name" ] || { log_error "Invalid selection."; return 1; }
+    printf '%s' "$name"
+}
+
+pick_relay() {
+    local names name i=1 choice
+    names="$(list_relay_names || true)"
+    if [ -z "$names" ]; then
+        log_info 'No relays are configured yet. Use "Add Relay" first.'
+        return 1
+    fi
+    {
+        printf 'Relays:\n'
+        while IFS= read -r name; do
+            printf '  %d. %s [%s]\n' "$i" "$name" "$(relay_health "$name")"
+            i=$((i + 1))
+        done <<<"$names"
+    } >&2
+    choice="$(ask "Select a relay by number" "1")"
     name="$(printf '%s\n' "$names" | sed -n "${choice}p")"
     [ -n "$name" ] || { log_error "Invalid selection."; return 1; }
     printf '%s' "$name"
@@ -500,6 +522,369 @@ e2e_selftest_menu() {
     run_e2e_streaming_test || true
 }
 
+# ---------------------------------------------------------------------------
+# Relay Management (Phase B) - additive; never touches the RTMP-publish
+# channel functions above.
+# ---------------------------------------------------------------------------
+relay_add_menu() {
+    print_banner "ADD RELAY"
+    local name display source_type url mode loop autostart rtsp_transport="tcp"
+
+    while :; do
+        name="$(ask "Relay name (lowercase, no spaces)" "")"
+        if ! is_valid_relay_name "$name"; then
+            log_error "Invalid name. Use lowercase letters, digits, - or _ (2-32 chars); not a reserved word."
+            continue
+        fi
+        if relay_exists "$name"; then
+            log_error "A relay named '$name' already exists."
+            continue
+        fi
+        if stream_exists "$name" 2>/dev/null; then
+            log_error "A publish channel named '$name' already exists; choose a different name."
+            continue
+        fi
+        break
+    done
+    display="$(ask "Display name" "$name")"
+
+    printf '\nSource type:\n1. Local file\n2. Remote HLS (.m3u8)\n3. RTMP\n4. RTMPS\n5. RTSP\n6. Remote HTTP/HTTPS media file\n'
+    case "$(ask "Choice" "1")" in
+        1) source_type="local" ;;
+        2) source_type="hls" ;;
+        3) source_type="rtmp" ;;
+        4) source_type="rtmps" ;;
+        5) source_type="rtsp" ;;
+        6) source_type="http" ;;
+        *) log_error "Invalid choice."; return 0 ;;
+    esac
+
+    if [ "$source_type" = "local" ]; then
+        while :; do
+            url="$(ask "Local file path" "")"
+            [ -f "$url" ] && break
+            log_error "File not found: $url"
+        done
+    else
+        while :; do
+            url="$(ask "Source URL" "")"
+            is_valid_relay_source_url "$url" && break
+            log_error "That URL looks invalid or contains unsafe characters."
+        done
+    fi
+
+    if [ "$source_type" = "rtsp" ]; then
+        printf '\nRTSP transport:\n1. TCP (recommended)\n2. UDP\n3. Auto\n'
+        case "$(ask "Choice" "1")" in
+            2) rtsp_transport="udp" ;;
+            3) rtsp_transport="auto" ;;
+            *) rtsp_transport="tcp" ;;
+        esac
+    fi
+
+    local loop_default="n"
+    [ "$source_type" = "local" ] && loop_default="y"
+    if confirm "Loop this source continuously (24/7)?" "$loop_default"; then loop="true"; else loop="false"; fi
+
+    if [ "$source_type" = "http" ] && [ "$loop" = "true" ]; then
+        if confirm "Download and cache this file locally before looping it? (recommended - avoids repeatedly re-fetching the remote file)" "y"; then
+            local cached
+            if cached="$(cache_remote_media "$url" "$name")"; then
+                url="$cached"
+                source_type="local"
+                log_ok "Cached to $url"
+            else
+                log_error "Download failed; cannot continue."
+                return 0
+            fi
+        fi
+    fi
+
+    printf '\nProbing source (this may take a few seconds)...\n\n'
+    if probe_relay_source "$source_type" "$url" "$rtsp_transport"; then
+        print_relay_probe_summary
+        if relay_stream_copy_compatible; then
+            mode="copy"
+        else
+            printf '\n'
+            log_warn "This source cannot be relayed directly to browser-compatible HLS without transcoding."
+            printf '1. Attempt Source Copy anyway (may fail or be unplayable)\n2. Compatibility Transcode (uses significant CPU)\n3. Cancel\n'
+            case "$(ask "Choice" "2")" in
+                1) mode="copy" ;;
+                2)
+                    log_warn "TRANSCODING REQUIRED. This will consume significant CPU for as long as this relay runs."
+                    confirm "Continue with Compatibility Transcode?" "n" || { log_info "Cancelled."; return 0; }
+                    mode="transcode"
+                    ;;
+                *) log_info "Cancelled."; return 0 ;;
+            esac
+        fi
+    else
+        log_warn "Could not probe this source (it may be temporarily offline, or ffprobe is unavailable)."
+        confirm "Save this relay anyway and try it later?" "n" || { log_info "Cancelled."; return 0; }
+        mode="copy"
+    fi
+
+    if confirm "Start this relay automatically at boot?" "y"; then autostart="true"; else autostart="false"; fi
+
+    add_relay "$name" "$display" "$source_type" "$url" "$mode" "$loop" "$autostart" "$rtsp_transport"
+    printf '\n'
+    print_relay_status "$name"
+}
+
+relay_list_menu() {
+    print_banner "RELAYS"
+    local names name
+    names="$(list_relay_names || true)"
+    if [ -z "$names" ]; then
+        log_info "No relays are configured yet."
+        return 0
+    fi
+    printf '%-18s %-10s %-8s %-10s %s\n' "NAME" "STATUS" "TYPE" "MODE" "SOURCE"
+    while IFS= read -r name; do
+        printf '%-18s %-10s %-8s %-10s %s\n' \
+            "$name" "$(relay_health "$name")" "$(get_relay_field "$name" SOURCE_TYPE)" \
+            "$(get_relay_field "$name" MODE)" "$(redact_source_url "$(get_relay_field "$name" SOURCE_URL)")"
+    done <<<"$names"
+}
+
+relay_status_menu() {
+    print_banner "RELAY STATUS"
+    local name
+    name="$(pick_relay)" || return 0
+    printf '\n'
+    print_relay_status "$name"
+}
+
+relay_start_menu() {
+    print_banner "START RELAY"
+    local name
+    name="$(pick_relay)" || return 0
+    start_relay "$name" 2>&1 && log_ok "Relay '$name' started." || log_error "Could not start relay '$name'. Check logs (option 12)."
+}
+
+relay_stop_menu() {
+    print_banner "STOP RELAY"
+    local name
+    name="$(pick_relay)" || return 0
+    stop_relay "$name" && log_ok "Relay '$name' stopped." || log_error "Could not stop relay '$name'."
+}
+
+relay_restart_menu() {
+    print_banner "RESTART RELAY"
+    local name
+    name="$(pick_relay)" || return 0
+    log_warn "This clears the relay's current HLS output before restarting."
+    confirm "Restart '$name'?" "y" || { log_info "Cancelled."; return 0; }
+    restart_relay "$name" && log_ok "Relay '$name' restarted." || log_error "Could not restart relay '$name'."
+}
+
+relay_edit_menu() {
+    print_banner "EDIT RELAY"
+    local name
+    name="$(pick_relay)" || return 0
+    printf '\n1. Loop (currently: %s)\n2. Autostart at boot (currently: %s)\n3. Output mode (currently: %s)\n0. Back\n' \
+        "$(get_relay_field "$name" LOOP)" "$(get_relay_field "$name" AUTOSTART)" "$(get_relay_field "$name" MODE)"
+    case "$(ask "Choice" "0")" in
+        1)
+            if confirm "Loop this source?" "y"; then
+                conf_set "$(relay_file "$name")" LOOP "true"
+            else
+                conf_set "$(relay_file "$name")" LOOP "false"
+            fi
+            chmod 600 "$(relay_file "$name")"
+            log_ok "Updated. Restart the relay for this to take effect."
+            ;;
+        2)
+            if confirm "Start automatically at boot?" "y"; then
+                conf_set "$(relay_file "$name")" AUTOSTART "true"
+                systemctl enable "m3u8-relay@${name}.service" >/dev/null 2>&1 || true
+            else
+                conf_set "$(relay_file "$name")" AUTOSTART "false"
+                systemctl disable "m3u8-relay@${name}.service" >/dev/null 2>&1 || true
+            fi
+            chmod 600 "$(relay_file "$name")"
+            log_ok "Updated."
+            ;;
+        3)
+            printf '1. Source Copy (recommended)\n2. Compatibility Transcode\n'
+            case "$(ask "Choice" "1")" in
+                2) conf_set "$(relay_file "$name")" MODE "transcode" ;;
+                *) conf_set "$(relay_file "$name")" MODE "copy" ;;
+            esac
+            chmod 600 "$(relay_file "$name")"
+            log_ok "Updated. Restart the relay for this to take effect."
+            ;;
+        *) ;;
+    esac
+}
+
+relay_change_source_menu() {
+    print_banner "CHANGE SOURCE URL"
+    local name url
+    name="$(pick_relay)" || return 0
+    printf 'Current source: %s\n' "$(redact_source_url "$(get_relay_field "$name" SOURCE_URL)")"
+    url="$(ask "New source URL/path" "")"
+    [ -n "$url" ] || { log_info "Cancelled."; return 0; }
+    set_relay_source "$name" "$url"
+    if confirm "Restart the relay now to apply the new source?" "y"; then
+        restart_relay "$name" && log_ok "Restarted." || log_error "Restart failed."
+    fi
+}
+
+relay_test_source_menu() {
+    print_banner "TEST SOURCE"
+    local source_type url rtsp_transport="tcp"
+    printf '1. Local file\n2. Remote HLS\n3. RTMP\n4. RTMPS\n5. RTSP\n6. HTTP/HTTPS media\n'
+    case "$(ask "Choice" "2")" in
+        1) source_type="local" ;;
+        2) source_type="hls" ;;
+        3) source_type="rtmp" ;;
+        4) source_type="rtmps" ;;
+        5) source_type="rtsp" ;;
+        6) source_type="http" ;;
+        *) log_error "Invalid choice."; return 0 ;;
+    esac
+    url="$(ask "Source URL/path" "")"
+    [ -n "$url" ] || return 0
+    if [ "$source_type" = "rtsp" ]; then
+        case "$(ask "RTSP transport (tcp/udp/auto)" "tcp")" in
+            udp) rtsp_transport="udp" ;;
+            auto) rtsp_transport="auto" ;;
+            *) rtsp_transport="tcp" ;;
+        esac
+    fi
+    printf '\nProbing (up to 10s)...\n\n'
+    if probe_relay_source "$source_type" "$url" "$rtsp_transport"; then
+        print_relay_probe_summary
+    else
+        log_error "Could not detect a usable video or audio stream from this source."
+    fi
+}
+
+relay_show_m3u8_menu() {
+    print_banner "RELAY M3U8 URL"
+    local name domain scheme
+    name="$(pick_relay)" || return 0
+    domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN)"
+    scheme="http"; [ "$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED 2>/dev/null || echo false)" = "true" ] && scheme="https"
+    printf '\n%s://%s/hls/relay/%s/index.m3u8\n' "$scheme" "$domain" "$name"
+}
+
+relay_show_player_menu() {
+    print_banner "RELAY PLAYER URL"
+    local name domain scheme
+    name="$(pick_relay)" || return 0
+    domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN)"
+    scheme="http"; [ "$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED 2>/dev/null || echo false)" = "true" ] && scheme="https"
+    printf '\n%s://%s/watch/%s\n' "$scheme" "$domain" "$name"
+}
+
+relay_logs_menu() {
+    local name
+    name="$(pick_relay)" || return 0
+    printf '\n1. Last 100 log lines\n2. Follow log (Ctrl+C to stop)\n0. Back\n'
+    case "$(ask "Choice" "1")" in
+        1) journalctl -u "m3u8-relay@${name}.service" -n 100 --no-pager ;;
+        2) journalctl -u "m3u8-relay@${name}.service" -f ;;
+        *) ;;
+    esac
+}
+
+relay_remove_menu() {
+    print_banner "REMOVE RELAY"
+    local name purge
+    name="$(pick_relay)" || return 0
+    printf '\nAbout to remove relay: %s\n' "$name"
+    confirm "Also delete this relay's HLS output on disk?" "y" && purge="true" || purge="false"
+    if confirm "Confirm permanent removal of '$name'?" "n"; then
+        remove_relay "$name" "$purge"
+    else
+        log_info "Cancelled."
+    fi
+}
+
+relay_health_check_menu() {
+    print_banner "RELAY HEALTH CHECK"
+    local name status
+    name="$(pick_relay)" || return 0
+    status="$(relay_health "$name")"
+    printf '\nStatus: %s\n' "$status"
+    if [ "$status" = "HEALTHY" ] || [ "$status" = "STALE" ] || [ "$status" = "STARTING" ]; then
+        printf 'FFmpeg process identity: %s\n' "$(relay_ffmpeg_identity_check "$name")"
+    fi
+}
+
+relay_bandwidth_menu() {
+    print_banner "ESTIMATE RELAY BANDWIDTH"
+    local bitrate viewers
+    bitrate="$(ask "Source bitrate in Mbps" "8")"
+    viewers="$(ask "Expected concurrent viewers" "10")"
+    printf '\n'
+    estimate_relay_bandwidth "$bitrate" "$viewers"
+}
+
+relay_selftest_menu() {
+    printf '\n'
+    log_info "This generates a tiny local test clip and relays it through a temporary channel, then removes it. It does not affect any real relay."
+    confirm "Run the relay self-test now?" "y" || { log_info "Cancelled."; return 0; }
+    printf '\n'
+    run_relay_e2e_test || true
+}
+
+relay_menu() {
+    local choice
+    while :; do
+        printf '\n'
+        print_banner "RELAY MANAGEMENT"
+        cat <<'EOF'
+ 1. Add Relay
+ 2. List Relays
+ 3. Relay Status
+ 4. Start Relay
+ 5. Stop Relay
+ 6. Restart Relay
+ 7. Edit Relay
+ 8. Change Source URL
+ 9. Test Source
+10. Show M3U8 URL
+11. Show Player URL
+12. View / Follow Relay Logs
+13. Remove Relay
+14. Run Relay Health Check
+15. Estimate Bandwidth
+16. Run Relay Self-Test (end-to-end)
+ 0. Back
+EOF
+        choice="$(ask "Select an option" "0")"
+        printf '\n'
+        case "$choice" in
+            1) relay_add_menu ;;
+            2) relay_list_menu ;;
+            3) relay_status_menu ;;
+            4) relay_start_menu ;;
+            5) relay_stop_menu ;;
+            6) relay_restart_menu ;;
+            7) relay_edit_menu ;;
+            8) relay_change_source_menu ;;
+            9) relay_test_source_menu ;;
+            10) relay_show_m3u8_menu ;;
+            11) relay_show_player_menu ;;
+            12) relay_logs_menu ;;
+            13) relay_remove_menu ;;
+            14) relay_health_check_menu ;;
+            15) relay_bandwidth_menu ;;
+            16) relay_selftest_menu ;;
+            0) return 0 ;;
+            *) log_error "Invalid option." ;;
+        esac
+        if [ "$choice" != "0" ]; then
+            printf '\nPress Enter to continue...'
+            read -r _ </dev/tty || true
+        fi
+    done
+}
+
 uninstall_menu() {
     print_banner "UNINSTALL SERVER"
     log_warn "Uninstalling removes this project's nginx configuration, manager command,"
@@ -547,6 +932,7 @@ show_menu() {
 24. Uninstall Server
 25. RTMP Authentication Diagnostics
 26. Run End-to-End Streaming Test
+27. Relay Management
  0. Exit
 EOF
 }
@@ -586,6 +972,7 @@ main() {
             24) uninstall_menu ;;
             25) auth_diagnostics_menu ;;
             26) e2e_selftest_menu ;;
+            27) relay_menu ;;
             0) log_info "Goodbye."; exit 0 ;;
             *) log_error "Invalid option." ;;
         esac

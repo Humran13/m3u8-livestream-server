@@ -141,4 +141,74 @@ run_diagnostics() {
     else
         _diag_warn "UFW is not installed."
     fi
+
+    # --- Relay subsystem (Phase B) ---------------------------------------
+    if command_exists ffprobe; then
+        _diag_pass "ffprobe available (relay source detection)."
+    else
+        _diag_warn "ffprobe not available; relay source detection will be limited."
+    fi
+    if command_exists setpriv; then
+        _diag_pass "setpriv available (required for the relay runner to drop privileges)."
+    else
+        _diag_fail "setpriv not available; relay mode cannot safely start."
+    fi
+    if id -u "$M3U8_RELAY_USER" >/dev/null 2>&1; then
+        _diag_pass "Dedicated relay system user ('$M3U8_RELAY_USER') exists."
+    else
+        _diag_warn "Dedicated relay system user ('$M3U8_RELAY_USER') not found."
+    fi
+    if [ -d "$M3U8_RELAYS_DIR" ]; then
+        local relays_owner relays_mode
+        relays_owner="$(stat -c '%U:%G' "$M3U8_RELAYS_DIR" 2>/dev/null || echo "")"
+        relays_mode="$(stat -c '%a' "$M3U8_RELAYS_DIR" 2>/dev/null || echo "")"
+        if [ "$relays_owner" = "root:root" ] && [ "$relays_mode" = "700" ]; then
+            _diag_pass "Relay config directory is root:root/700 (secrets not exposed to www-data or m3u8-relay)."
+        else
+            _diag_fail "Relay config directory is ${relays_owner:-unknown}/${relays_mode:-unknown}, expected root:root/700 - relay source URLs may be exposed to an unrelated identity."
+        fi
+    else
+        _diag_warn "Relay config directory not found ($M3U8_RELAYS_DIR)."
+    fi
+    if [ -f "$M3U8_RELAY_RUNNER" ]; then
+        local runner_owner runner_mode
+        runner_owner="$(stat -c '%U:%G' "$M3U8_RELAY_RUNNER" 2>/dev/null || echo "")"
+        runner_mode="$(stat -c '%a' "$M3U8_RELAY_RUNNER" 2>/dev/null || echo "")"
+        if [ "$runner_owner" = "root:root" ] && [ "$runner_mode" = "700" ]; then
+            _diag_pass "Relay runner is root:root/700 (not writable by m3u8-relay or www-data)."
+        else
+            _diag_fail "Relay runner is ${runner_owner:-unknown}/${runner_mode:-unknown}, expected root:root/700 - the script systemd runs as root could potentially be modified by an unprivileged identity."
+        fi
+    else
+        _diag_warn "Relay runner not found ($M3U8_RELAY_RUNNER)."
+    fi
+    if [ -f "$M3U8_RELAY_SYSTEMD_TEMPLATE" ]; then
+        local unit_owner
+        unit_owner="$(stat -c '%U:%G' "$M3U8_RELAY_SYSTEMD_TEMPLATE" 2>/dev/null || echo "")"
+        if [ "$unit_owner" = "root:root" ]; then
+            _diag_pass "Relay systemd unit installed (root:root)."
+        else
+            _diag_fail "Relay systemd unit is owned by '$unit_owner', expected root:root."
+        fi
+    else
+        _diag_warn "Relay systemd template not found ($M3U8_RELAY_SYSTEMD_TEMPLATE)."
+    fi
+
+    local relay_count=0 relay_healthy=0 relay_failed=0 relay_stale=0 rname rstate
+    for rname in $(list_relay_names 2>/dev/null || true); do
+        relay_count=$((relay_count + 1))
+        rstate="$(relay_health "$rname")"
+        case "$rstate" in
+            HEALTHY) relay_healthy=$((relay_healthy + 1)) ;;
+            STALE) relay_stale=$((relay_stale + 1)) ;;
+            STOPPED|OFFLINE) relay_failed=$((relay_failed + 1)) ;;
+        esac
+    done
+    if [ "$relay_count" -gt 0 ]; then
+        _diag_pass "$relay_count relay(s) configured ($relay_healthy healthy, $relay_stale stale, $relay_failed stopped/offline)."
+        [ "$relay_stale" -gt 0 ] && _diag_warn "$relay_stale relay(s) reporting STALE output - HLS is not updating even though the service is running."
+        [ "$relay_failed" -gt 0 ] && _diag_warn "$relay_failed relay(s) are stopped/offline."
+    else
+        _diag_warn "No relays configured yet."
+    fi
 }

@@ -23,6 +23,8 @@ source "${M3U8_SCRIPT_DIR}/lib/streams.sh"
 source "${M3U8_SCRIPT_DIR}/lib/ssl.sh"
 # shellcheck source=lib/firewall.sh
 source "${M3U8_SCRIPT_DIR}/lib/firewall.sh"
+# shellcheck source=lib/relay.sh
+source "${M3U8_SCRIPT_DIR}/lib/relay.sh"
 # shellcheck source=lib/diagnostics.sh
 source "${M3U8_SCRIPT_DIR}/lib/diagnostics.sh"
 # shellcheck source=lib/selftest.sh
@@ -320,6 +322,20 @@ ln -sf "$M3U8_INSTALL_DIR/status.sh" "$M3U8_STATUS_LINK"
 log_ok "Installed commands: m3u8-manager, m3u8-status"
 
 # ---------------------------------------------------------------------------
+# Relay subsystem (Phase B) - additive, never touches the RTMP-publish
+# path above. A relay failure here is not fatal to the rest of the
+# install; OBS publishing must keep working even if FFmpeg is somehow
+# unavailable.
+# ---------------------------------------------------------------------------
+RELAY_SUBSYSTEM_READY=1
+if install_relay_runtime; then
+    log_ok "Relay subsystem installed."
+else
+    RELAY_SUBSYSTEM_READY=0
+    log_warn "Relay subsystem could not be fully installed; relay features will be unavailable. RTMP publish/HLS is unaffected."
+fi
+
+# ---------------------------------------------------------------------------
 # Verify before declaring success - a package finishing "install" is not
 # the same as the server actually working.
 # ---------------------------------------------------------------------------
@@ -338,14 +354,23 @@ if [ "$FIREWALL_CHOICE" = "yes" ]; then
     if ufw_installed && ufw_is_active; then _diag_pass "UFW firewall is active"; else _diag_warn "Firewall was requested but is not active - see the firewall messages above"; fi
 fi
 
+RELAY_HEALTHY=0
 if [ "$OPT_NONINTERACTIVE" -eq 0 ]; then
     printf '\n'
     if confirm "Run a full end-to-end RTMP -> HLS self-test now? (publishes a ~14s synthetic test stream to a temporary channel, then removes it)" "y"; then
         printf '\n'
         run_e2e_streaming_test || INSTALL_HEALTHY=0
     fi
+
+    if [ "$RELAY_SUBSYSTEM_READY" -eq 1 ]; then
+        printf '\n'
+        if confirm "Run the relay subsystem self-test now? (generates a tiny local test clip and relays it through a temporary channel, then removes it)" "y"; then
+            printf '\n'
+            run_relay_e2e_test && RELAY_HEALTHY=1
+        fi
+    fi
 else
-    log_info "Skipping the interactive end-to-end self-test in non-interactive mode. Run it later: sudo m3u8-manager -> option 26."
+    log_info "Skipping the interactive self-tests in non-interactive mode. Run them later: sudo m3u8-manager -> options 26/28."
 fi
 
 # ---------------------------------------------------------------------------
@@ -367,6 +392,15 @@ if [ "$HAS_EXISTING_CHANNELS" -eq 0 ]; then
     printf '\n\nM3U8 URL:\n%s\n\n' "$(hls_url_for "$CHANNEL_NAME")"
 else
     printf 'Existing channel(s) were left unchanged. Use "sudo m3u8-manager" -> Show OBS Settings for their details.\n\n'
+fi
+if [ "$RELAY_SUBSYSTEM_READY" -eq 1 ]; then
+    if [ "$RELAY_HEALTHY" -eq 1 ]; then
+        printf 'Relay subsystem: PASS (self-test succeeded)\n\n'
+    else
+        printf 'Relay subsystem: installed, not yet verified - run "sudo m3u8-manager" -> Relay Management -> Run Relay Self-Test\n\n'
+    fi
+else
+    printf 'Relay subsystem: NOT AVAILABLE (see warnings above)\n\n'
 fi
 printf 'MANAGE SERVER:\n\nsudo m3u8-manager\n\n'
 printf 'CHECK STATUS:\n\nsudo m3u8-manager\nor\nsudo m3u8-status\n\n'

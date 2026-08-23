@@ -92,7 +92,40 @@ if command_exists nginx; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3: optional removal of HLS media files
+# Step 3: stop/disable relay services (Phase B) and remove the systemd
+# template unit. Relay config itself lives under $M3U8_CONFIG_DIR and is
+# handled together with the rest of it in Step 6.
+# ---------------------------------------------------------------------------
+if command_exists systemctl; then
+    for _relay_unit in $(systemctl list-units --all --plain --no-legend 'm3u8-relay@*.service' 2>/dev/null | awk '{print $1}'); do
+        systemctl stop "$_relay_unit" 2>/dev/null || true
+        systemctl disable "$_relay_unit" 2>/dev/null || true
+        log_ok "Stopped and disabled $_relay_unit"
+    done
+fi
+if [ -f "$M3U8_RELAY_SYSTEMD_TEMPLATE" ]; then
+    rm -f "$M3U8_RELAY_SYSTEMD_TEMPLATE"
+    systemctl daemon-reload 2>/dev/null || true
+    log_ok "Removed $M3U8_RELAY_SYSTEMD_TEMPLATE"
+fi
+if [ -d "$M3U8_MEDIA_DIR" ]; then
+    if confirm "Delete cached/imported relay media files at $M3U8_MEDIA_DIR?" "n"; then
+        rm -rf "${M3U8_MEDIA_DIR:?}"
+        log_ok "Removed $M3U8_MEDIA_DIR"
+    else
+        log_info "Kept $M3U8_MEDIA_DIR"
+    fi
+fi
+if id -u "$M3U8_RELAY_USER" >/dev/null 2>&1; then
+    if confirm "Remove the '$M3U8_RELAY_USER' system user this project created for relay processes?" "n"; then
+        userdel "$M3U8_RELAY_USER" 2>/dev/null || log_error "Could not remove user '$M3U8_RELAY_USER'; remove it manually if desired."
+    else
+        log_info "Kept system user '$M3U8_RELAY_USER'."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Step 4: optional removal of HLS media files (RTMP-publish and relay)
 # ---------------------------------------------------------------------------
 if [ -d "$M3U8_WEB_ROOT" ]; then
     if confirm "Delete web root and HLS media files at $M3U8_WEB_ROOT?" "n"; then
@@ -104,7 +137,7 @@ if [ -d "$M3U8_WEB_ROOT" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4: optional removal of SSL certificate for the configured domain
+# Step 5: optional removal of SSL certificate for the configured domain
 # ---------------------------------------------------------------------------
 if [ -n "$DOMAIN" ] && command_exists certbot && [ -d "/etc/letsencrypt/live/${DOMAIN}" ]; then
     if confirm "Delete the Let's Encrypt certificate for ${DOMAIN}? (other domains' certificates are never touched)" "n"; then
@@ -115,7 +148,7 @@ if [ -n "$DOMAIN" ] && command_exists certbot && [ -d "/etc/letsencrypt/live/${D
 fi
 
 # ---------------------------------------------------------------------------
-# Step 5: optional removal of UFW rules added by this project
+# Step 6: optional removal of UFW rules added by this project
 # ---------------------------------------------------------------------------
 if ufw_installed && ufw_is_active; then
     if confirm "Remove the UFW firewall rules this project added (tagged 'm3u8-server:')?" "n"; then
@@ -129,7 +162,7 @@ if ufw_installed && ufw_is_active; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: configuration, keys, and backups
+# Step 7: configuration, keys, and backups
 # ---------------------------------------------------------------------------
 if [ -d "$M3U8_CONFIG_DIR" ]; then
     log_warn "$M3U8_CONFIG_DIR contains channel records and stream keys."
@@ -142,7 +175,7 @@ if [ -d "$M3U8_CONFIG_DIR" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 7: installed project files
+# Step 8: installed project files
 # ---------------------------------------------------------------------------
 if [ -d "$M3U8_INSTALL_DIR" ]; then
     rm -rf "${M3U8_INSTALL_DIR:?}"
@@ -150,7 +183,7 @@ if [ -d "$M3U8_INSTALL_DIR" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8: optional package removal (never automatic)
+# Step 9: optional package removal (never automatic)
 # ---------------------------------------------------------------------------
 if confirm "Also remove the nginx, RTMP module, certbot and ffmpeg packages from this system? (Not recommended if you installed them for other purposes)" "n"; then
     DEBIAN_FRONTEND=noninteractive apt-get remove -y nginx libnginx-mod-rtmp certbot python3-certbot-nginx ffmpeg || true

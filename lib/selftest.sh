@@ -285,3 +285,153 @@ run_e2e_streaming_test() {
     fi
     [ "$overall_pass" -eq 1 ]
 }
+
+# run_relay_e2e_test
+# Proves the relay subsystem (Phase B) independently of any external
+# source: generates a tiny local synthetic MP4 once (short, low
+# resolution - this validates relay/repackaging capability, not encoding
+# throughput), creates a disposable local-loop copy-mode relay from it,
+# starts it via systemd, and verifies HLS output through to a decodable
+# playlist. Always cleans up the temporary relay, its HLS output, and the
+# generated test file, even on failure. Never touches any real relay.
+_relay_e2e_name=""
+_relay_e2e_tmpfile=""
+
+_relay_e2e_cleanup() {
+    trap - RETURN
+    if [ -n "$_relay_e2e_name" ] && relay_exists "$_relay_e2e_name"; then
+        remove_relay "$_relay_e2e_name" "true" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$_relay_e2e_tmpfile" ] && [ -f "$_relay_e2e_tmpfile" ]; then
+        rm -f "$_relay_e2e_tmpfile"
+    fi
+    _relay_e2e_name=""
+    _relay_e2e_tmpfile=""
+}
+
+run_relay_e2e_test() {
+    trap _relay_e2e_cleanup RETURN
+
+    local i=0 domain scheme playlist overall_pass=1 fetch_code
+
+    print_banner "RELAY END-TO-END SELF-TEST"
+
+    if ! command_exists ffmpeg; then
+        _diag_fail "FFmpeg is not available; cannot run the relay self-test."
+        return 1
+    fi
+    _diag_pass "FFmpeg available"
+
+    if [ ! -f "$M3U8_RELAY_SYSTEMD_TEMPLATE" ]; then
+        _diag_fail "Relay systemd template not installed ($M3U8_RELAY_SYSTEMD_TEMPLATE missing)."
+        return 1
+    fi
+    _diag_pass "Relay systemd template installed"
+
+    # --- generate a tiny local test clip (one-time, bounded cost) --------
+    _relay_e2e_tmpfile="$(mktemp --suffix=.mp4 2>/dev/null || mktemp)"
+    if ! ffmpeg -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc=size=320x240:rate=25:duration=5" \
+        -f lavfi -i "sine=frequency=800:duration=5" \
+        -c:v libx264 -preset veryfast -g 25 -c:a aac \
+        -f mp4 -movflags +faststart \
+        "$_relay_e2e_tmpfile" >/dev/null 2>&1; then
+        _diag_fail "Could not generate the local test clip."
+        return 1
+    fi
+    chmod 644 "$_relay_e2e_tmpfile"
+    _diag_pass "Local test clip generated"
+
+    while :; do
+        _relay_e2e_name="selftest-relay-$(openssl rand -hex 3 2>/dev/null || echo "$RANDOM")"
+        relay_exists "$_relay_e2e_name" || break
+        i=$((i + 1))
+        [ "$i" -lt 20 ] || { _diag_fail "Could not allocate a temporary relay name."; return 1; }
+    done
+
+    if ! add_relay "$_relay_e2e_name" "Self-Test Relay (temporary)" "local" "$_relay_e2e_tmpfile" "copy" "true" "false" "tcp" 2>/tmp/m3u8-relay-selftest-add.log; then
+        _diag_fail "Could not create the temporary test relay."
+        cat /tmp/m3u8-relay-selftest-add.log >&2 2>/dev/null || true
+        return 1
+    fi
+    _diag_pass "Temporary test relay created"
+
+    if ! start_relay "$_relay_e2e_name" 2>/dev/null; then
+        _diag_fail "Relay service failed to start."
+        return 1
+    fi
+
+    sleep 7
+
+    if systemctl is-active --quiet "m3u8-relay@${_relay_e2e_name}.service"; then
+        _diag_pass "Relay service is running"
+    else
+        _diag_fail "Relay service is not running after start (check: journalctl -u m3u8-relay@${_relay_e2e_name})"
+        overall_pass=0
+    fi
+
+    # Verifies the REAL kernel-reported UID of the running process, not
+    # merely that the service is "active" - this is the same check a real
+    # relay's health status uses, exercised here against the disposable
+    # test relay so the privilege-drop path itself is proven, not assumed.
+    local identity_result
+    identity_result="$(relay_ffmpeg_identity_check "$_relay_e2e_name")"
+    if [[ "$identity_result" == PASS* ]]; then
+        _diag_pass "FFmpeg process identity: $identity_result"
+    else
+        _diag_fail "FFmpeg process identity: $identity_result"
+        overall_pass=0
+    fi
+
+    playlist="${M3U8_RELAY_HLS_DIR}/${_relay_e2e_name}/index.m3u8"
+    if [ -f "$playlist" ]; then
+        _diag_pass "Relay HLS playlist generated"
+    else
+        _diag_fail "Relay HLS playlist was not generated at $playlist"
+        overall_pass=0
+    fi
+
+    if find "${M3U8_RELAY_HLS_DIR}/${_relay_e2e_name}" -maxdepth 1 -name '*.ts' -print -quit 2>/dev/null | grep -q .; then
+        _diag_pass "Relay HLS media segments generated"
+    else
+        _diag_fail "No relay HLS media segments (.ts) were found"
+        overall_pass=0
+    fi
+
+    if [ "$overall_pass" -eq 1 ]; then
+        domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN 2>/dev/null || echo "")"
+        if [ -n "$domain" ]; then
+            scheme="http"
+            [ "$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED 2>/dev/null || echo false)" = "true" ] && scheme="https"
+            fetch_code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+                --resolve "${domain}:80:127.0.0.1" --resolve "${domain}:443:127.0.0.1" \
+                "${scheme}://${domain}/hls/relay/${_relay_e2e_name}/index.m3u8" 2>/dev/null || echo "000")"
+            if [ "$fetch_code" = "200" ]; then
+                _diag_pass "Relay HLS playlist retrievable over HTTP(S) at the public URL"
+            else
+                _diag_fail "Relay HLS playlist fetch over HTTP(S) returned $fetch_code, expected 200"
+                overall_pass=0
+            fi
+        else
+            _diag_warn "No domain configured; skipped the public HTTP fetch check."
+        fi
+
+        if command_exists ffprobe; then
+            if ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+                -of csv=p=0 "$playlist" >/dev/null 2>&1; then
+                _diag_pass "ffprobe confirms the relay playlist contains a decodable video stream"
+            else
+                _diag_fail "ffprobe could not read a video stream from the relay playlist"
+                overall_pass=0
+            fi
+        fi
+    fi
+
+    printf '\n'
+    if [ "$overall_pass" -eq 1 ]; then
+        print_banner "RELAY SELF-TEST PASSED"
+    else
+        print_banner "RELAY SELF-TEST FAILED"
+    fi
+    [ "$overall_pass" -eq 1 ]
+}

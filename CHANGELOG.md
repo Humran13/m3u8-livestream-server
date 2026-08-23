@@ -4,6 +4,81 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Hardened (Phase B relay - privileged-bootstrap review)
+- Relay runner is now installed atomically (`root:root`/700, temp file +
+  rename in the same directory, never a truncate-in-place) with explicit
+  post-install ownership/mode verification - `install_relay_runtime`
+  refuses to mark the relay subsystem ready if any check fails.
+- `relay-runner.sh` now fails closed, before touching any config, if
+  `setpriv` or the `m3u8-relay` account is missing at runtime (not just
+  checked once at install time), and re-validates its output path is
+  provably inside the relay HLS root at the privileged boundary rather
+  than trusting earlier validation.
+- Managed media directory (`/var/lib/m3u8-server/media`) tightened to
+  `root:m3u8-relay`/750 (was `m3u8-relay:m3u8-relay`/755) - the relay
+  process can read cached/imported media via the group bit but can no
+  longer write there; only root (via the manager's cache/import flow)
+  writes new media.
+- Systemd unit gained `PrivateDevices`, `ProtectKernelTunables`,
+  `ProtectKernelModules`, `ProtectControlGroups`, `LockPersonality`
+  unconditionally (all supported since systemd 232/235, older than every
+  targeted release), plus `RestrictSUIDSGID` conditionally generated only
+  when the installed systemd is 242+, so older-but-supported Ubuntu
+  releases never receive a directive their systemd predates.
+- New `relay_ffmpeg_identity_check`: inspects the *actual* kernel-reported
+  UID of the relay's main process (via its `MainPID`) rather than trusting
+  configuration or "service active" alone - surfaced in relay status, the
+  manager's health-check menu, and the relay self-test, which now fails
+  if FFmpeg is not confirmed running as `m3u8-relay`.
+- Local-file relay sources are now probed for read access *as the actual
+  `m3u8-relay` user* (via `setpriv ... test -r`) before FFmpeg starts,
+  producing a clear error instead of a delayed, more cryptic FFmpeg
+  failure - without ever auto-adjusting permissions.
+
+### Added (Phase B - 24/7 source relay)
+- New relay subsystem (`lib/relay.sh`, `lib/relay-runner.sh`): pulls a
+  local file, remote HLS, RTMP/RTMPS, RTSP, or HTTP media source and
+  republishes it as this server's own HLS output, stream-copied by
+  default (`-c:v copy -c:a copy`, no re-encoding) - entirely separate
+  from, and running alongside, the RTMP-publish channel path.
+- Each relay is supervised by a systemd template unit
+  (`m3u8-relay@<name>.service`, `config/systemd/m3u8-relay@.service.template`)
+  with `Restart=on-failure` and a rate-limited restart policy. FFmpeg
+  runs as a new dedicated system account (`m3u8-relay`) - never
+  `www-data` and never root - via a root-controlled bootstrap: the
+  runner starts as root (only to read the root-restricted relay config),
+  then permanently drops to `m3u8-relay` with `setpriv` before FFmpeg
+  (the process that actually talks to the network) ever starts. FFmpeg
+  is invoked via a real Bash argument array in the runner - never a
+  shell string built from a source URL.
+- `m3u8-manager` → **27. Relay Management**: add/list/status/start/stop/
+  restart/edit relay, change source, test a source before saving
+  (ffprobe-based codec/resolution/bitrate summary with a stream-copy
+  compatibility verdict), view/follow logs, remove, per-relay health
+  check (HEALTHY/STALE/OFFLINE/STARTING/STOPPED/DISABLED - a running
+  service whose HLS output has stopped updating is reported STALE, not
+  healthy), bandwidth estimator, and an end-to-end relay self-test.
+- Relay source URLs (which may contain credentials/tokens) are stored in
+  `root:root`/700/600 config - deliberately not readable by `www-data`
+  or any other unrelated service identity - redacted in all manager
+  output, and never written to the public manifest
+  (`relays.generated.json`, a file entirely separate from the
+  RTMP-publish `channels.generated.json`).
+- Relay config uses the same safe `KEY="value"` format as everything else
+  in the project (never shell-sourced), validated before ever reaching an
+  FFmpeg argument list.
+- `install.sh` now installs FFmpeg unconditionally (previously optional),
+  provisions the relay runner/systemd template/config and media
+  directories, and offers an interactive relay self-test alongside the
+  existing RTMP self-test, reporting "Relay subsystem: PASS" only if that
+  test actually passes.
+- Web player now merges `relays.generated.json` alongside
+  `channels.generated.json` and shows a non-healthy relay's status inline
+  in the channel picker.
+- `uninstall.sh` now stops/disables all relay service instances and
+  removes the relay systemd template as part of its existing conservative,
+  confirmation-gated cleanup.
+
 ### Fixed
 - Generated Nginx configuration now sets `map_hash_bucket_size 256;`
   before the stream-key allow-list `map` block (in both the HTTP and SSL
