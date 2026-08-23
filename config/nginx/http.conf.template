@@ -30,8 +30,7 @@ server {
     access_log off;
 
     location = /auth {
-        if ($m3u8_stream_allowed = 1) { return 204; }
-        return 403;
+        __AUTH_LOCATION_BODY__
     }
 }
 

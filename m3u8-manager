@@ -30,6 +30,8 @@ source "${M3U8_SCRIPT_DIR}/lib/ssl.sh"
 source "${M3U8_SCRIPT_DIR}/lib/firewall.sh"
 # shellcheck source=lib/diagnostics.sh
 source "${M3U8_SCRIPT_DIR}/lib/diagnostics.sh"
+# shellcheck source=lib/selftest.sh
+source "${M3U8_SCRIPT_DIR}/lib/selftest.sh"
 
 require_root "$@"
 
@@ -78,6 +80,13 @@ show_status() {
         printf 'Nginx configuration on disk: valid\n'
     else
         printf 'Nginx configuration on disk: INVALID (run option 12, Test Nginx Configuration, for details)\n'
+    fi
+    local auth_mode
+    auth_mode="$(current_auth_mode)"
+    if [ "$auth_mode" = "off" ]; then
+        printf 'RTMP publish authentication: OFF - INSECURE (see option 25)\n'
+    else
+        printf 'RTMP publish authentication: %s\n' "$auth_mode"
     fi
     printf 'RTMP port %s listening: %s\n' "$M3U8_RTMP_PORT" "$(port_listening "$M3U8_RTMP_PORT" && echo yes || echo no)"
     printf 'HTTP port 80 listening: %s\n' "$(port_listening 80 && echo yes || echo no)"
@@ -444,6 +453,53 @@ project_info_menu() {
     printf 'Supported Ubuntu versions: %s\n' "${M3U8_SUPPORTED_UBUNTU[*]}"
 }
 
+auth_diagnostics_menu() {
+    print_banner "RTMP AUTHENTICATION DIAGNOSTICS"
+    local mode
+    mode="$(current_auth_mode)"
+    printf 'Current auth mode: %s\n' "$mode"
+    if [ "$mode" = "off" ]; then
+        log_warn "RTMP publishing authentication is DISABLED."
+        log_warn "Anyone who can reach port ${M3U8_RTMP_PORT} can publish to this server."
+    fi
+    printf '\n1. Run authentication self-test\n2. Switch to stream-key mode (secure, default)\n3. Switch to OFF mode (diagnostics only - INSECURE)\n0. Back\n'
+    case "$(ask "Choice" "0")" in
+        1) printf '\n'; test_auth_endpoint ;;
+        2)
+            if [ "$mode" = "stream-key" ]; then
+                log_info "Already in stream-key mode."
+            elif set_auth_mode "stream-key" && reload_nginx; then
+                log_ok "Auth mode set to stream-key (secure)."
+            else
+                log_error "Could not switch to stream-key mode; see above."
+            fi
+            ;;
+        3)
+            log_warn "This will allow ANYONE who can reach port ${M3U8_RTMP_PORT} to publish to this server."
+            if confirm "Disable RTMP publishing authentication?" "n"; then
+                if set_auth_mode "off" && reload_nginx; then
+                    log_warn "WARNING: RTMP publishing authentication is disabled."
+                    log_warn "Anyone who can reach port ${M3U8_RTMP_PORT} can publish to this server."
+                    log_warn "Re-enable it (option 2) as soon as diagnostics are finished."
+                else
+                    log_error "Could not switch auth mode; see above."
+                fi
+            else
+                log_info "Cancelled."
+            fi
+            ;;
+        *) ;;
+    esac
+}
+
+e2e_selftest_menu() {
+    printf '\n'
+    log_info "This publishes a short (about 14s) synthetic test stream to a temporary channel, then removes it. It does not affect any real channel or stream."
+    confirm "Run the end-to-end streaming self-test now?" "y" || { log_info "Cancelled."; return 0; }
+    printf '\n'
+    run_e2e_streaming_test || true
+}
+
 uninstall_menu() {
     print_banner "UNINSTALL SERVER"
     log_warn "Uninstalling removes this project's nginx configuration, manager command,"
@@ -489,6 +545,8 @@ show_menu() {
 22. Server Diagnostics
 23. Project Information
 24. Uninstall Server
+25. RTMP Authentication Diagnostics
+26. Run End-to-End Streaming Test
  0. Exit
 EOF
 }
@@ -526,6 +584,8 @@ main() {
             22) diagnostics_menu ;;
             23) project_info_menu ;;
             24) uninstall_menu ;;
+            25) auth_diagnostics_menu ;;
+            26) e2e_selftest_menu ;;
             0) log_info "Goodbye."; exit 0 ;;
             *) log_error "Invalid option." ;;
         esac

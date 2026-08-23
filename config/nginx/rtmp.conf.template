@@ -18,10 +18,21 @@ rtmp {
             live on;
             record off;
 
-            # Every publish attempt is checked against the generated
-            # stream-key allow list (see streamkeys.map) before nginx will
-            # accept the incoming stream.
-            on_publish http://127.0.0.1:__AUTH_PORT__/auth?name=$name;
+            # ngx_rtmp_notify_module parses on_publish into a STATIC URL at
+            # config-load time - it does not interpolate RTMP variables
+            # (like $name) into that string per-request the way core
+            # nginx's proxy_pass does. The module supplies the real stream
+            # name itself, as one of its own parameters (app, name, type,
+            # etc.), using whichever transport notify_method selects. The
+            # default (post) puts those in the request body, which plain
+            # $arg_* variables on the HTTP side can never see. Using "get"
+            # makes the module append them as a real query string onto the
+            # URL below, so $arg_name on the auth server actually reflects
+            # the stream name being published - a bare URL with no manual
+            # "?name=$name" appended (that literal string would never have
+            # been substituted).
+            notify_method get;
+            on_publish http://127.0.0.1:__AUTH_PORT__/auth;
 
             hls on;
             hls_path __HLS_DIR__;

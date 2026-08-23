@@ -40,6 +40,11 @@ M3U8_NGINX_SITE_LINK="${M3U8_NGINX_SITES_ENABLED}/${M3U8_NGINX_SITE_NAME}"
 M3U8_AUTH_PORT="8899"
 M3U8_RTMP_PORT="1935"
 M3U8_RTMP_APP_DEFAULT="live"
+# "stream-key" (default, secure) checks every publish against the
+# generated allow list; "off" accepts any publish unconditionally and
+# exists only for diagnostics/emergency troubleshooting - never the
+# installer default, never silently switched to on failure.
+M3U8_AUTH_MODE_DEFAULT="stream-key"
 
 M3U8_MANAGER_LINK="/usr/local/bin/m3u8-manager"
 M3U8_STATUS_LINK="/usr/local/bin/m3u8-status"
@@ -155,6 +160,10 @@ is_valid_channel_name() {
 is_valid_rtmp_app_name() {
     local name="$1"
     [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{1,31}$ ]]
+}
+
+is_valid_auth_mode() {
+    [ "$1" = "stream-key" ] || [ "$1" = "off" ]
 }
 
 # Stream keys are written verbatim into a generated Nginx map ("KEY 1;"),
@@ -349,4 +358,21 @@ print_banner() {
     printf '========================================\n'
     printf '%s\n' "$title"
     printf '========================================\n'
+}
+
+# Shared PASS/WARNING/FAIL reporters, used by lib/diagnostics.sh and
+# lib/selftest.sh alike so neither has an ordering dependency on the other.
+_diag_pass() { printf '[PASS]    %s\n' "$1"; }
+_diag_warn() { printf '[WARNING] %s\n' "$1"; }
+_diag_fail() { printf '[FAIL]    %s\n' "$1"; }
+
+port_listening() {
+    local port="$1"
+    if command_exists ss; then
+        ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[.:]${port}\$"
+    elif command_exists netstat; then
+        netstat -tln 2>/dev/null | awk '{print $4}' | grep -qE "[.:]${port}\$"
+    else
+        return 2
+    fi
 }

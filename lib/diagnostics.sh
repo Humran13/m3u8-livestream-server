@@ -8,20 +8,6 @@ if [ -n "${M3U8_DIAGNOSTICS_LOADED:-}" ]; then
 fi
 M3U8_DIAGNOSTICS_LOADED=1
 
-_diag_pass() { printf '[PASS]    %s\n' "$1"; }
-_diag_warn() { printf '[WARNING] %s\n' "$1"; }
-_diag_fail() { printf '[FAIL]    %s\n' "$1"; }
-
-port_listening() {
-    local port="$1"
-    if command_exists ss; then
-        ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[.:]${port}\$"
-    elif command_exists netstat; then
-        netstat -tln 2>/dev/null | awk '{print $4}' | grep -qE "[.:]${port}\$"
-    else
-        return 2
-    fi
-}
 
 run_diagnostics() {
     local domain ssl_enabled output stream_count disk_avail pkg dns_status
@@ -103,11 +89,9 @@ run_diagnostics() {
     fi
 
     if [ -d "$M3U8_HLS_DIR" ]; then
-        if [ -w "$M3U8_HLS_DIR" ]; then
-            _diag_pass "HLS directory exists and is writable: $M3U8_HLS_DIR"
-        else
-            _diag_fail "HLS directory exists but is not writable: $M3U8_HLS_DIR"
-        fi
+        # Checks the real Nginx worker user can write here, not just that
+        # the directory exists - see lib/selftest.sh.
+        test_hls_directory_writable
         if find "$M3U8_HLS_DIR" -maxdepth 1 -name '*.m3u8' -print -quit 2>/dev/null | grep -q .; then
             _diag_pass "At least one HLS playlist is currently present (a stream may be live)."
         else
@@ -116,6 +100,14 @@ run_diagnostics() {
     else
         _diag_fail "HLS directory does not exist: $M3U8_HLS_DIR"
     fi
+
+    if [ "$nginx_config_valid" -eq 1 ] && grep -qE '^\s*rtmp\s*\{' "$M3U8_NGINX_RTMP_CONF" 2>/dev/null; then
+        _diag_pass "RTMP module configuration is present and loaded."
+    else
+        _diag_warn "Could not confirm the RTMP module configuration is loaded."
+    fi
+
+    test_auth_endpoint
 
     stream_count=0
     if [ -d "$M3U8_STREAMS_DIR" ]; then

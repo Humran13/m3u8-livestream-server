@@ -101,10 +101,36 @@ write_rtmp_conf() {
         "HLS_PLAYLIST_LENGTH=${hls_playlist_length}"
 }
 
+# Reads the configured RTMP publish-authentication mode from server.conf,
+# defaulting to the secure "stream-key" mode if unset or invalid (e.g. an
+# install predating this setting). Never defaults to "off".
+current_auth_mode() {
+    local mode
+    mode="$(conf_get "$M3U8_SERVER_CONF" AUTH_MODE 2>/dev/null || echo "")"
+    if is_valid_auth_mode "$mode"; then
+        printf '%s' "$mode"
+    else
+        printf '%s' "$M3U8_AUTH_MODE_DEFAULT"
+    fi
+}
+
+# Builds the Nginx snippet for the /auth location body. In "off" mode every
+# publish is accepted unconditionally - this exists only for diagnostics/
+# emergency use and is never selected automatically.
+auth_location_body_for() {
+    if [ "$1" = "off" ]; then
+        printf '# RTMP publish authentication is DISABLED (AUTH_MODE=off).\n        # Anyone who can reach the RTMP port can publish. See m3u8-manager.\n        return 204;'
+    else
+        printf 'if ($m3u8_stream_allowed = 1) { return 204; }\n        return 403;'
+    fi
+}
+
 # Writes the HTTP-side site config. Picks the plain-HTTP or SSL template
 # depending on whether a certificate already exists for the domain.
 write_http_conf() {
     local domain="$1" ssl_enabled="$2" cert_path="$3" key_path="$4"
+    local auth_location_body
+    auth_location_body="$(auth_location_body_for "$(current_auth_mode)")"
     ensure_dir "$M3U8_NGINX_SITES_AVAILABLE" 755 root:root
     ensure_dir "$M3U8_NGINX_SITES_ENABLED" 755 root:root
     ensure_dir "$(dirname "$M3U8_STREAMKEYS_MAP")" 750 root:root
@@ -134,7 +160,8 @@ write_http_conf() {
             "SSL_CERT=${cert_path}" \
             "SSL_KEY=${key_path}" \
             "HTTP2_LISTEN_SUFFIX=${http2_listen_suffix}" \
-            "HTTP2_DIRECTIVE_LINE=${http2_directive_line}"
+            "HTTP2_DIRECTIVE_LINE=${http2_directive_line}" \
+            "AUTH_LOCATION_BODY=${auth_location_body}"
     else
         render_template "${M3U8_PROJECT_ROOT}/config/nginx/http.conf.template" \
             "$M3U8_NGINX_SITE_FILE" 644 \
@@ -143,12 +170,60 @@ write_http_conf() {
             "WEB_ROOT=${M3U8_WEB_ROOT}" \
             "CHANNELS_JSON=${M3U8_CHANNELS_JSON}" \
             "HLS_DIR=${M3U8_HLS_DIR}" \
-            "STREAMKEYS_MAP=${M3U8_STREAMKEYS_MAP}"
+            "STREAMKEYS_MAP=${M3U8_STREAMKEYS_MAP}" \
+            "AUTH_LOCATION_BODY=${auth_location_body}"
     fi
 
     if [ ! -L "$M3U8_NGINX_SITE_LINK" ]; then
         ln -sf "$M3U8_NGINX_SITE_FILE" "$M3U8_NGINX_SITE_LINK"
     fi
+}
+
+# set_auth_mode <stream-key|off>
+# Switches the RTMP publish-authentication mode transactionally: persists
+# the new mode, regenerates the site config, and validates with `nginx -t`
+# before leaving it active. On failure, both the site file and the
+# persisted mode are reverted - a rejected candidate never becomes the
+# live AUTH_MODE. Does not reload Nginx itself; the caller does that once
+# this returns successfully.
+set_auth_mode() {
+    local mode="$1" domain ssl_enabled cert_path="" key_path="" backup_site="" output
+    is_valid_auth_mode "$mode" || { log_error "Invalid auth mode: $mode"; return 1; }
+
+    domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN 2>/dev/null || echo "")"
+    ssl_enabled="$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED 2>/dev/null || echo "false")"
+    if [ "$ssl_enabled" = "true" ]; then
+        cert_path="$(cert_path_for "$domain")"
+        key_path="$(key_path_for "$domain")"
+    fi
+
+    if [ -f "$M3U8_NGINX_SITE_FILE" ]; then
+        backup_site="$(mktemp "${M3U8_NGINX_SITE_FILE}.previous.XXXXXX")"
+        cp -a "$M3U8_NGINX_SITE_FILE" "$backup_site"
+    fi
+
+    conf_set "$M3U8_SERVER_CONF" AUTH_MODE "$mode"
+    write_http_conf "$domain" "$ssl_enabled" "$cert_path" "$key_path"
+
+    if output="$(test_nginx)"; then
+        [ -n "$backup_site" ] && rm -f "$backup_site"
+        return 0
+    fi
+
+    log_error "Switching to auth mode '$mode' produced an invalid Nginx configuration:"
+    printf '%s\n' "$output" >&2
+    if [ -n "$backup_site" ]; then
+        mv -f "$backup_site" "$M3U8_NGINX_SITE_FILE"
+    fi
+    # Only two modes exist, so "the other one" is provably what was active
+    # before this call - revert the persisted setting to match.
+    if [ "$mode" = "off" ]; then
+        conf_set "$M3U8_SERVER_CONF" AUTH_MODE "stream-key"
+    else
+        conf_set "$M3U8_SERVER_CONF" AUTH_MODE "off"
+    fi
+    log_error "Reverted to the previous auth mode and site configuration."
+    return 1
 }
 
 # activate_site_config <domain> <want_ssl> <cert_path> <key_path>

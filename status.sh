@@ -28,6 +28,8 @@ source "${M3U8_SCRIPT_DIR}/lib/ssl.sh"
 source "${M3U8_SCRIPT_DIR}/lib/firewall.sh"
 # shellcheck source=lib/diagnostics.sh
 source "${M3U8_SCRIPT_DIR}/lib/diagnostics.sh"
+# shellcheck source=lib/selftest.sh
+source "${M3U8_SCRIPT_DIR}/lib/selftest.sh"
 
 require_root "$@"
 detect_os

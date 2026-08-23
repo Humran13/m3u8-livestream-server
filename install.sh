@@ -23,6 +23,10 @@ source "${M3U8_SCRIPT_DIR}/lib/streams.sh"
 source "${M3U8_SCRIPT_DIR}/lib/ssl.sh"
 # shellcheck source=lib/firewall.sh
 source "${M3U8_SCRIPT_DIR}/lib/firewall.sh"
+# shellcheck source=lib/diagnostics.sh
+source "${M3U8_SCRIPT_DIR}/lib/diagnostics.sh"
+# shellcheck source=lib/selftest.sh
+source "${M3U8_SCRIPT_DIR}/lib/selftest.sh"
 
 trap 'log_error "Installation aborted (line $LINENO). No further changes will be made."' ERR
 
@@ -217,6 +221,10 @@ conf_set "$M3U8_SERVER_CONF" HLS_FRAGMENT "$OPT_HLS_FRAGMENT"
 conf_set "$M3U8_SERVER_CONF" HLS_PLAYLIST_LENGTH "$OPT_HLS_PLAYLIST_LENGTH"
 if [ "$ALREADY_INSTALLED" -eq 0 ]; then
     conf_set "$M3U8_SERVER_CONF" INSTALL_DATE "$(date -Iseconds)"
+    # Never overridden on a rerun - if an administrator switched this to
+    # "off" for diagnostics, reinstalling must not silently re-secure (or
+    # re-expose) it out from under them.
+    conf_set "$M3U8_SERVER_CONF" AUTH_MODE "$M3U8_AUTH_MODE_DEFAULT"
 fi
 conf_set "$M3U8_SERVER_CONF" VERSION "$(cat "${M3U8_PROJECT_ROOT}/VERSION" 2>/dev/null || echo "dev")"
 chmod 640 "$M3U8_SERVER_CONF"
@@ -312,11 +320,45 @@ ln -sf "$M3U8_INSTALL_DIR/status.sh" "$M3U8_STATUS_LINK"
 log_ok "Installed commands: m3u8-manager, m3u8-status"
 
 # ---------------------------------------------------------------------------
+# Verify before declaring success - a package finishing "install" is not
+# the same as the server actually working.
+# ---------------------------------------------------------------------------
+printf '\n'
+print_banner "VERIFYING INSTALLATION"
+INSTALL_HEALTHY=1
+test_nginx >/dev/null 2>&1 && _diag_pass "Nginx configuration is valid" || { _diag_fail "Nginx configuration is valid"; INSTALL_HEALTHY=0; }
+nginx_is_running && _diag_pass "Nginx service is running" || { _diag_fail "Nginx service is running"; INSTALL_HEALTHY=0; }
+port_listening "$M3U8_RTMP_PORT" && _diag_pass "RTMP port ${M3U8_RTMP_PORT} is listening" || { _diag_fail "RTMP port ${M3U8_RTMP_PORT} is listening"; INSTALL_HEALTHY=0; }
+test_auth_endpoint || INSTALL_HEALTHY=0
+test_hls_directory_writable || INSTALL_HEALTHY=0
+if [ "$SSL_ENABLED" = "true" ]; then
+    port_listening 443 && _diag_pass "HTTPS port 443 is listening" || _diag_warn "HTTPS port 443 is not listening"
+fi
+if [ "$FIREWALL_CHOICE" = "yes" ]; then
+    if ufw_installed && ufw_is_active; then _diag_pass "UFW firewall is active"; else _diag_warn "Firewall was requested but is not active - see the firewall messages above"; fi
+fi
+
+if [ "$OPT_NONINTERACTIVE" -eq 0 ]; then
+    printf '\n'
+    if confirm "Run a full end-to-end RTMP -> HLS self-test now? (publishes a ~14s synthetic test stream to a temporary channel, then removes it)" "y"; then
+        printf '\n'
+        run_e2e_streaming_test || INSTALL_HEALTHY=0
+    fi
+else
+    log_info "Skipping the interactive end-to-end self-test in non-interactive mode. Run it later: sudo m3u8-manager -> option 26."
+fi
+
+# ---------------------------------------------------------------------------
 # Completion screen
 # ---------------------------------------------------------------------------
 SCHEME="http"; [ "$SSL_ENABLED" = "true" ] && SCHEME="https"
 printf '\n'
-print_banner "M3U8 LIVESTREAM SERVER INSTALLED"
+if [ "$INSTALL_HEALTHY" -eq 1 ]; then
+    print_banner "M3U8 LIVESTREAM SERVER INSTALLED"
+else
+    print_banner "INSTALLATION COMPLETED WITH ERRORS"
+    log_warn "One or more verification checks above failed. Review them before relying on this server - run 'sudo m3u8-manager' -> Server Diagnostics for details."
+fi
 printf 'Domain:\n%s\n\n' "$DOMAIN"
 printf 'WEB PLAYER:\n%s://%s/\n\n' "$SCHEME" "$DOMAIN"
 if [ "$HAS_EXISTING_CHANNELS" -eq 0 ]; then
