@@ -8,8 +8,18 @@ if [ -n "${M3U8_SSL_LOADED:-}" ]; then
 fi
 M3U8_SSL_LOADED=1
 
+# Installs certbot via the distro package manager only - never falls back
+# to Snap just because one Ubuntu release happens to package it
+# differently, and never bypasses package-signature verification. Reports
+# clearly (via return status) if certbot genuinely isn't available for
+# this release rather than assuming it always is.
 install_certbot() {
-    apt_install certbot python3-certbot-nginx
+    if ! package_available certbot; then
+        log_error "The certbot package is not available for this Ubuntu release (${OS_PRETTY_NAME:-unknown}). SSL cannot be configured automatically."
+        return 1
+    fi
+    ensure_command certbot certbot python3-certbot-nginx \
+        || { log_error "certbot could not be installed, or its binary is still missing after installation."; return 1; }
 }
 
 cert_path_for() {

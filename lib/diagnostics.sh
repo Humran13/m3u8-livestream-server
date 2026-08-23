@@ -26,6 +26,15 @@ port_listening() {
 run_diagnostics() {
     local domain ssl_enabled output stream_count disk_avail pkg dns_status
 
+    if detect_os 2>/dev/null && [ -n "${OS_PRETTY_NAME:-}" ]; then
+        _diag_pass "OS: ${OS_PRETTY_NAME} (${OS_CODENAME:-unknown codename}, ${OS_ARCH:-unknown arch})"
+    fi
+    if detect_nginx_version; then
+        _diag_pass "Nginx version: $NGINX_VERSION"
+    else
+        _diag_warn "Could not determine the installed Nginx version."
+    fi
+
     if systemctl is-active --quiet nginx; then
         _diag_pass "Nginx service is running."
     else
@@ -112,7 +121,7 @@ run_diagnostics() {
     fi
 
     for pkg in nginx libnginx-mod-rtmp certbot ffmpeg; do
-        if dpkg -s "$pkg" >/dev/null 2>&1; then
+        if package_installed "$pkg"; then
             _diag_pass "Package installed: $pkg"
         else
             _diag_warn "Package not installed: $pkg"

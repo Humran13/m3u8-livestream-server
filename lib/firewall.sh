@@ -62,7 +62,19 @@ firewall_status_report() {
 # administrator has already agreed via a CLI flag.
 setup_firewall() {
     local ssl_enabled="$1" ssh_ports port
-    apt_install ufw
+
+    # Do NOT trust dpkg package state alone here (see package_installed in
+    # lib/common.sh) - a real Ubuntu 24.04 test had a stale dpkg record for
+    # ufw that made a plain `apt_install ufw` believe it was already
+    # present, when the actual binary was missing. Verify the real binary,
+    # and fail this function gracefully (not the whole installer) if it
+    # genuinely cannot be made available.
+    if ! ensure_command ufw ufw; then
+        log_error "Firewall configuration was requested, but the ufw package could not be installed (or its binary is still missing after installation)."
+        log_error "Continuing without firewall changes. Retry later with: sudo apt-get install ufw, then reconfigure from m3u8-manager."
+        return 1
+    fi
+
     ssh_ports="$(detect_ssh_ports)"
 
     while IFS= read -r port; do
@@ -86,4 +98,5 @@ setup_firewall() {
         ufw --force enable
     fi
     log_ok "Firewall rules applied."
+    return 0
 }

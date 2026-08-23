@@ -39,9 +39,11 @@ channel.
 
 ## Requirements
 
-- **Supported OS**: Ubuntu 20.04, 22.04, 24.04, or 26.04 LTS (other
+- **Supported OS**: Ubuntu 18.04, 20.04, 22.04, 24.04, or 26.04 LTS (other
   distributions and unsupported Ubuntu versions are detected and rejected
-  before anything is changed)
+  before anything is changed). "Supported" means the installer targets and
+  actively accounts for that release; see [Support matrix](#support-matrix)
+  below for which releases have actually been verified on a real VPS.
 - **A domain name** pointed at your VPS's public IP (required for SSL;
   recommended even for HTTP-only use)
 - **VPS resources**: 1 vCPU / 1 GB RAM minimum for a single low-bitrate
@@ -275,11 +277,57 @@ later versions include adaptive bitrate transcoding, DVR/recording, stream
 statistics, tokenized playback, SRT/WHIP ingest, Docker packaging, and a web
 administration API. None of these are implemented yet.
 
+## Support matrix
+
+"Installer target" means the code actively detects and accounts for that
+release (package availability checks, version-aware Nginx config
+generation, etc.). "Real VPS tested" means an actual install has been run
+end-to-end on that release and confirmed working - these are tracked
+separately on purpose, and a release is never marked tested just because
+the installer contains logic for it.
+
+| Ubuntu | Installer target | Real VPS tested |
+| ------ | ----------------- | ---------------- |
+| 18.04  | Yes                | No                |
+| 20.04  | Yes                | No                |
+| 22.04  | Yes                | No                |
+| 24.04  | Yes                | In progress - see below |
+| 26.04  | Yes                | No                |
+
 ## Testing status
 
 The Bash scripts in this repository have been statically reviewed and
 syntax-checked (`bash -n`), and the generated Nginx configuration has been
 reviewed for correctness against the Nginx and nginx-rtmp-module
-documentation. They have **not** yet been exercised end-to-end on a live
-Ubuntu 20.04/22.04/24.04/26.04 VPS. Please report any issues you hit during
-real-world deployment.
+documentation.
+
+A real install has been attempted on **Ubuntu 24.04.4 LTS (x86_64, Nginx
+1.24.0)**. That attempt surfaced two real bugs, both now fixed:
+
+1. The generated SSL configuration used the standalone `http2 on;`
+   directive, which does not exist before Nginx 1.25.1 - Nginx 1.24.0
+   rejected it with `unknown directive "http2"`. The installer now detects
+   the actual installed Nginx version and generates the HTTP/2 syntax that
+   version supports, rather than assuming one syntax for all releases.
+2. Firewall setup crashed with `ufw: command not found` even though the
+   installer had already attempted to install it - a stale dpkg record
+   (package present in the dpkg database but not actually installed, e.g.
+   `deinstall ok config-files`) made the installer believe `ufw` was
+   already there. Package-presence checks across the whole project now
+   verify actual command availability, not just dpkg database state, and a
+   firewall setup failure no longer aborts the rest of the installation.
+
+The installer was also made safe to rerun against a partially-completed
+install left in that exact state (Nginx/RTMP/HTTP working, certificate
+issued, SSL config broken, firewall never configured) - rerunning
+`install.sh` now repairs the SSL config, reuses the existing certificate
+without requesting a new one, installs `ufw` if it's genuinely missing, and
+leaves any already-created channel and its stream key untouched.
+
+**This has not yet been confirmed as a full, clean end-to-end pass** (fresh
+VPS, OBS publishing, HLS playback, VLC, web player, second channel,
+disable/enable, key rotation, backup/restore, uninstall). Ubuntu
+18.04/20.04/22.04/26.04 have received no real VPS testing at all - only
+static review and the version-detection logic described above, which is
+specifically designed not to assume a fixed Nginx/package version per
+release. Please report any issues you hit during real-world deployment.

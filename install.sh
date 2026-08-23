@@ -101,13 +101,26 @@ fi
 
 ensure_dir "$M3U8_CONFIG_DIR" 750 root:root
 print_banner "M3U8 LIVESTREAM SERVER - INSTALLER"
-printf 'Detected: %s (%s)\n' "$OS_PRETTY_NAME" "$OS_ARCH"
+printf 'Detected: %s (%s, %s)\n' "$OS_PRETTY_NAME" "${OS_CODENAME:-unknown codename}" "$OS_ARCH"
+printf 'Kernel: %s\n' "${OS_KERNEL:-unknown}"
 printf 'Project root: %s\n\n' "$M3U8_PROJECT_ROOT"
 
 ALREADY_INSTALLED=0
 if [ -f "$M3U8_SERVER_CONF" ]; then
     ALREADY_INSTALLED=1
     log_info "An existing installation was detected. Settings will be reused where possible; press Enter to keep a shown default."
+fi
+
+# Whether a first channel needs to be created is decided by whether one
+# already exists, NOT by whether server.conf exists. A previous run can
+# legitimately have written server.conf and then failed before ever
+# reaching add_stream (exactly what happened during the real Ubuntu 24.04
+# test, which aborted at the firewall step) - gating on ALREADY_INSTALLED
+# alone would then skip channel creation forever on every future rerun.
+HAS_EXISTING_CHANNELS=0
+if [ -n "$(list_stream_names 2>/dev/null || true)" ]; then
+    HAS_EXISTING_CHANNELS=1
+    log_info "Existing channel(s) detected; their stream keys will not be touched."
 fi
 
 # ---------------------------------------------------------------------------
@@ -157,7 +170,7 @@ else
         FIREWALL_CHOICE="no"
     fi
 
-    if [ "$ALREADY_INSTALLED" -eq 0 ]; then
+    if [ "$HAS_EXISTING_CHANNELS" -eq 0 ]; then
         while :; do
             CHANNEL_NAME="$(ask "Name for your first stream/channel" "main")"
             is_valid_channel_name "$CHANNEL_NAME" && break
@@ -206,45 +219,47 @@ chmod 640 "$M3U8_SERVER_CONF"
 
 write_rtmp_conf "$RTMP_APP" "${OPT_HLS_FRAGMENT}s" "${OPT_HLS_PLAYLIST_LENGTH}s"
 
-# HTTP config first (SSL config needs a working HTTP site for the ACME
-# webroot challenge if a certificate does not exist yet).
+# Bring the site up over HTTP first (or straight to SSL, if a certificate
+# for this domain already exists from a previous run - e.g. recovering
+# from a run that got a certificate but then failed later, as happened in
+# the real Ubuntu 24.04 test). activate_site_config never leaves an
+# invalid candidate active: it validates before touching anything, and
+# falls back to HTTP-only automatically if the SSL candidate doesn't pass.
 CERT_PATH=""
 KEY_PATH=""
 if [ "$SSL_ENABLED" = "true" ] && certificate_exists "$DOMAIN"; then
+    log_info "Reusing existing Let's Encrypt certificate for $DOMAIN (no new certificate will be requested)."
     CERT_PATH="$(cert_path_for "$DOMAIN")"
     KEY_PATH="$(key_path_for "$DOMAIN")"
-    write_http_conf "$DOMAIN" "true" "$CERT_PATH" "$KEY_PATH"
-else
-    write_http_conf "$DOMAIN" "false" "" ""
 fi
+
+log_info "Generating and validating the Nginx site configuration..."
+SSL_ENABLED="$(activate_site_config "$DOMAIN" "$SSL_ENABLED" "$CERT_PATH" "$KEY_PATH")" \
+    || die "Neither the SSL nor the HTTP Nginx configuration could be validated. See output above. The previous working configuration (if any) was not touched."
+conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "$SSL_ENABLED"
 regenerate_streamkeys_map
 
-log_info "Testing nginx configuration..."
-if ! test_nginx; then
-    die "Generated nginx configuration is invalid. See output above. No service was reloaded."
-fi
 systemctl enable nginx >/dev/null 2>&1 || true
 systemctl reload nginx 2>/dev/null || systemctl restart nginx
 log_ok "Nginx is configured and running."
 
-if [ "$SSL_ENABLED" = "true" ] && ! certificate_exists "$DOMAIN"; then
-    install_certbot
-    if obtain_certificate "$DOMAIN" "$EMAIL"; then
-        CERT_PATH="$(cert_path_for "$DOMAIN")"
-        KEY_PATH="$(key_path_for "$DOMAIN")"
-        write_http_conf "$DOMAIN" "true" "$CERT_PATH" "$KEY_PATH"
-        if test_nginx; then
-            systemctl reload nginx
+# If SSL was requested but there's still no certificate, try to obtain one
+# now and re-activate the site config with it. A failure here (DNS not
+# ready, certbot unavailable, rate limits, etc.) must not take down the
+# HTTP service that is already running.
+if [ "$SSL_ENABLED" = "false" ] && [ "$SSL_CHOICE" = "yes" ] && ! certificate_exists "$DOMAIN"; then
+    if install_certbot && obtain_certificate "$DOMAIN" "$EMAIL"; then
+        SSL_ENABLED="$(activate_site_config "$DOMAIN" "true" "$(cert_path_for "$DOMAIN")" "$(key_path_for "$DOMAIN")")"
+        conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "$SSL_ENABLED"
+        regenerate_streamkeys_map
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx
+        if [ "$SSL_ENABLED" = "true" ]; then
+            log_ok "SSL enabled for $DOMAIN."
         else
-            log_error "SSL configuration failed validation; continuing on HTTP only."
-            write_http_conf "$DOMAIN" "false" "" ""
-            systemctl reload nginx
-            SSL_ENABLED="false"
-            conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "false"
+            log_warn "SSL could not be enabled; continuing on HTTP only."
         fi
     else
-        SSL_ENABLED="false"
-        conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "false"
+        log_warn "Could not obtain an SSL certificate; continuing on HTTP only. Retry later from m3u8-manager's SSL Management menu."
     fi
 fi
 
@@ -252,22 +267,31 @@ if [ "$FIREWALL_CHOICE" = "yes" ]; then
     ssh_ports_display="$(detect_ssh_ports | tr '\n' ',' | sed 's/,$//')"
     log_warn "About to configure UFW. This will allow: SSH (${ssh_ports_display}/tcp), HTTP (80/tcp)$( [ "$SSL_ENABLED" = "true" ] && printf ', HTTPS (443/tcp)' ) and RTMP (${M3U8_RTMP_PORT}/tcp)."
     if [ "$OPT_NONINTERACTIVE" -eq 1 ] || confirm "Proceed?" "y"; then
-        setup_firewall "$SSL_ENABLED"
+        # A firewall problem (e.g. ufw missing/uninstallable) must not
+        # abort an otherwise-successful install - this is exactly what
+        # happened during the real Ubuntu 24.04 test.
+        setup_firewall "$SSL_ENABLED" \
+            || log_error "Firewall setup did not complete. Continuing with the rest of the installation; you can retry from m3u8-manager."
     else
         log_info "Firewall setup skipped."
     fi
 fi
 
-if [ "$ALREADY_INSTALLED" -eq 0 ]; then
-    if [ "$STREAM_KEY_CHOICE" = "auto" ] || [ -z "$STREAM_KEY_CHOICE" ]; then
-        FIRST_KEY="$(generate_stream_key)"
+if [ "$HAS_EXISTING_CHANNELS" -eq 0 ]; then
+    if stream_exists "$CHANNEL_NAME"; then
+        # A previous run got far enough to create this channel but failed
+        # later (e.g. at the firewall step); do not touch its key.
+        log_info "Channel '$CHANNEL_NAME' already exists; leaving its stream key unchanged."
     else
-        FIRST_KEY="$STREAM_KEY_CHOICE"
+        if [ "$STREAM_KEY_CHOICE" = "auto" ] || [ -z "$STREAM_KEY_CHOICE" ]; then
+            FIRST_KEY="$(generate_stream_key)"
+        else
+            FIRST_KEY="$STREAM_KEY_CHOICE"
+        fi
+        add_stream "$CHANNEL_NAME" "$CHANNEL_NAME" "$FIRST_KEY" "true"
     fi
-    add_stream "$CHANNEL_NAME" "$CHANNEL_NAME" "$FIRST_KEY" "true"
-else
-    sync_channels_json "$DOMAIN" "$SSL_ENABLED"
 fi
+sync_channels_json "$DOMAIN" "$SSL_ENABLED"
 
 # ---------------------------------------------------------------------------
 # Install the manager + status command launchers
@@ -291,10 +315,12 @@ printf '\n'
 print_banner "M3U8 LIVESTREAM SERVER INSTALLED"
 printf 'Domain:\n%s\n\n' "$DOMAIN"
 printf 'WEB PLAYER:\n%s://%s/\n\n' "$SCHEME" "$DOMAIN"
-if [ "$ALREADY_INSTALLED" -eq 0 ]; then
+if [ "$HAS_EXISTING_CHANNELS" -eq 0 ]; then
     printf 'OBS SETTINGS\n\n'
     print_obs_settings "$CHANNEL_NAME"
     printf '\n\nM3U8 URL:\n%s\n\n' "$(hls_url_for "$CHANNEL_NAME")"
+else
+    printf 'Existing channel(s) were left unchanged. Use "sudo m3u8-manager" -> Show OBS Settings for their details.\n\n'
 fi
 printf 'MANAGE SERVER:\n\nsudo m3u8-manager\n\n'
 printf 'CHECK STATUS:\n\nsudo m3u8-manager\nor\nsudo m3u8-status\n\n'

@@ -12,6 +12,32 @@ M3U8_NGINX_LOADED=1
 M3U8_RTMP_INCLUDE_MARKER="# m3u8-server: load RTMP module configuration"
 M3U8_RTMP_INCLUDE_LINE="include ${M3U8_NGINX_RTMP_D}/*.conf;"
 
+# Detected once and cached here. Never assume this from the Ubuntu release -
+# different releases (and backports on the same release) ship different
+# Nginx versions, and Nginx's own feature syntax is what actually matters.
+NGINX_VERSION=""
+
+# Populates NGINX_VERSION from the real installed binary (never assumed
+# from the Ubuntu release). Safe to call repeatedly; only re-parses if not
+# already known this run.
+detect_nginx_version() {
+    [ -n "$NGINX_VERSION" ] && return 0
+    command_exists nginx || return 1
+    NGINX_VERSION="$(nginx -v 2>&1 | grep -oE 'nginx/[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | cut -d/ -f2)"
+    [ -n "$NGINX_VERSION" ]
+}
+
+# Nginx moved HTTP/2 from a `listen ... http2;` parameter to a standalone
+# `http2 on;` directive in 1.25.1. Using the new directive against an older
+# Nginx fails validation outright with "unknown directive \"http2\"" - this
+# is the exact bug seen on a real Ubuntu 24.04 install shipping Nginx
+# 1.24.0. Always branch on the actually-detected version, never on the
+# Ubuntu release.
+nginx_supports_standalone_http2() {
+    detect_nginx_version || return 1
+    version_ge "$NGINX_VERSION" "1.25.1"
+}
+
 # render_template <template_file> <dest_file> <mode> "KEY=value" ...
 # Simple __KEY__ substitution using bash string replacement, so paths and
 # URLs containing '/' never break a sed delimiter.
@@ -29,13 +55,22 @@ render_template() {
 
 install_nginx_rtmp() {
     log_info "Installing nginx and the RTMP module..."
-    apt_install nginx
+    ensure_command nginx nginx \
+        || die "The nginx package could not be installed, or its binary is still missing after installation. Detected: ${OS_PRETTY_NAME:-unknown} (${OS_ARCH:-unknown})."
+
     if package_available libnginx-mod-rtmp; then
         apt_install libnginx-mod-rtmp
+        package_installed libnginx-mod-rtmp \
+            || die "The libnginx-mod-rtmp package failed to install. Detected: ${OS_PRETTY_NAME:-unknown} (${OS_ARCH:-unknown})."
     else
-        die "The libnginx-mod-rtmp package is not available for this Ubuntu release. Cannot continue without RTMP support."
+        die "The libnginx-mod-rtmp package is not available for this Ubuntu release (${OS_PRETTY_NAME:-unknown}). Cannot continue without RTMP support."
     fi
-    apt_install openssl
+
+    ensure_command openssl openssl \
+        || die "OpenSSL could not be installed. Detected: ${OS_PRETTY_NAME:-unknown} (${OS_ARCH:-unknown})."
+
+    detect_nginx_version && log_info "Detected Nginx version: $NGINX_VERSION" \
+        || log_warn "Could not determine the installed Nginx version; will assume legacy HTTP/2 syntax."
 }
 
 # Adds the single include line the RTMP module needs at the top level of
@@ -80,6 +115,14 @@ write_http_conf() {
     fi
 
     if [ "$ssl_enabled" = "true" ]; then
+        local http2_listen_suffix http2_directive_line
+        if nginx_supports_standalone_http2; then
+            http2_listen_suffix=""
+            http2_directive_line="http2 on;"
+        else
+            http2_listen_suffix=" http2"
+            http2_directive_line=""
+        fi
         render_template "${M3U8_PROJECT_ROOT}/config/nginx/http-ssl.conf.template" \
             "$M3U8_NGINX_SITE_FILE" 644 \
             "DOMAIN=${domain}" \
@@ -89,7 +132,9 @@ write_http_conf() {
             "HLS_DIR=${M3U8_HLS_DIR}" \
             "STREAMKEYS_MAP=${M3U8_STREAMKEYS_MAP}" \
             "SSL_CERT=${cert_path}" \
-            "SSL_KEY=${key_path}"
+            "SSL_KEY=${key_path}" \
+            "HTTP2_LISTEN_SUFFIX=${http2_listen_suffix}" \
+            "HTTP2_DIRECTIVE_LINE=${http2_directive_line}"
     else
         render_template "${M3U8_PROJECT_ROOT}/config/nginx/http.conf.template" \
             "$M3U8_NGINX_SITE_FILE" 644 \
@@ -104,6 +149,44 @@ write_http_conf() {
     if [ ! -L "$M3U8_NGINX_SITE_LINK" ]; then
         ln -sf "$M3U8_NGINX_SITE_FILE" "$M3U8_NGINX_SITE_LINK"
     fi
+}
+
+# activate_site_config <domain> <want_ssl> <cert_path> <key_path>
+# The single place that decides what actually gets activated: generates the
+# best available candidate (SSL if requested and a certificate is on disk,
+# otherwise HTTP-only), validates it with `nginx -t`, and only ever leaves
+# a *validated* candidate on disk. If the SSL candidate fails validation
+# (e.g. an Nginx-version/syntax mismatch), this automatically regenerates
+# and validates the HTTP-only candidate instead - a working HTTP server
+# must never be sacrificed to a broken SSL config. Nginx itself is not
+# reloaded here; the caller reloads once activation succeeds. Prints
+# "true" or "false" for the SSL state that was actually activated (which
+# the caller should persist via conf_set), and returns non-zero only if
+# even the HTTP-only candidate fails validation.
+activate_site_config() {
+    local domain="$1" want_ssl="$2" cert_path="$3" key_path="$4" output
+
+    if [ "$want_ssl" = "true" ] && [ -n "$cert_path" ] && [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+        write_http_conf "$domain" "true" "$cert_path" "$key_path"
+        if output="$(test_nginx)"; then
+            printf 'true'
+            return 0
+        fi
+        log_error "Generated SSL configuration failed Nginx validation (installed Nginx: ${NGINX_VERSION:-unknown})."
+        printf '%s\n' "$output" >&2
+        log_error "Falling back to HTTP-only configuration. The existing certificate for $domain is untouched and will be reused automatically once this is fixed."
+    fi
+
+    write_http_conf "$domain" "false" "" ""
+    if output="$(test_nginx)"; then
+        printf 'false'
+        return 0
+    fi
+
+    log_error "Generated HTTP configuration also failed Nginx validation."
+    printf '%s\n' "$output" >&2
+    printf 'false'
+    return 1
 }
 
 # Regenerates the stream-key allow list from every stream record on disk.

@@ -44,7 +44,7 @@ M3U8_RTMP_APP_DEFAULT="live"
 M3U8_MANAGER_LINK="/usr/local/bin/m3u8-manager"
 M3U8_STATUS_LINK="/usr/local/bin/m3u8-status"
 
-M3U8_SUPPORTED_UBUNTU=("20.04" "22.04" "24.04" "26.04")
+M3U8_SUPPORTED_UBUNTU=("18.04" "20.04" "22.04" "24.04" "26.04")
 
 # Resolve the directory this project's scripts are running from, whether that
 # is the git checkout (pre-install / dev usage) or the installed copy under
@@ -257,16 +257,37 @@ apt_update_once() {
     fi
 }
 
+# Returns 0 only if dpkg reports this package as *currently* installed.
+# A bare `dpkg -s <pkg>` exit code is NOT sufficient for this: dpkg -s
+# returns 0 as long as ANY record exists for the package, including a
+# "deinstall ok config-files" state (removed but not purged) - a real
+# state seen on some cloud providers' minimal Ubuntu images (this is
+# exactly what caused ufw to be silently skipped during install on a real
+# Ubuntu 24.04 test: dpkg had a stale record, so apt_install believed it
+# was already present). Always check the actual Status field.
+package_installed() {
+    local status
+    status="$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" || return 1
+    [[ "$status" == *"install ok installed"* ]]
+}
+
+package_available() {
+    apt_update_once
+    apt-cache show "$1" >/dev/null 2>&1
+}
+
 # apt_install <pkg> [pkg...]
-# Installs only packages that are not already present.
+# Installs only packages that are not already present (per package_installed,
+# not a raw dpkg exit code).
 apt_install() {
     local pkgs=() pkg
     for pkg in "$@"; do
-        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        if ! package_installed "$pkg"; then
             pkgs+=("$pkg")
         fi
     done
     if [ "${#pkgs[@]}" -eq 0 ]; then
+        log_info "Already installed: $*"
         return 0
     fi
     apt_update_once
@@ -274,9 +295,30 @@ apt_install() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
 }
 
-package_available() {
-    apt_update_once
-    apt-cache show "$1" >/dev/null 2>&1
+# ensure_command <command> <package> [package...]
+# Guarantees <command> is actually runnable, installing the given
+# package(s) if needed. Unlike relying on apt_install/dpkg state alone,
+# this checks the real binary afterward - the only thing that actually
+# matters to the rest of the script - and reports failure via return
+# status rather than assuming success. Does not die: callers decide
+# whether a missing command is fatal (e.g. nginx) or something to
+# gracefully degrade around (e.g. ufw).
+ensure_command() {
+    local cmd="$1"; shift
+    command_exists "$cmd" && return 0
+    apt_install "$@" || true
+    command_exists "$cmd"
+}
+
+# version_ge <a> <b>
+# True if dotted version <a> is greater than or equal to <b>, using a real
+# numeric version sort (GNU coreutils `sort -V`) rather than a fragile
+# lexical string comparison (which gets "1.9" vs "1.10" wrong).
+version_ge() {
+    [ "$1" = "$2" ] && return 0
+    local newest
+    newest="$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)"
+    [ "$newest" = "$1" ]
 }
 
 # ---------------------------------------------------------------------------

@@ -10,17 +10,25 @@ M3U8_OSDETECT_LOADED=1
 
 OS_ID=""
 OS_VERSION_ID=""
+OS_CODENAME=""
 OS_PRETTY_NAME=""
 OS_ARCH=""
+OS_KERNEL=""
 
+# Reads distro identity from /etc/os-release (never lsb_release, which is
+# not guaranteed to be installed on a minimal image). Each field is read in
+# its own subshell so os-release's own variable names (NAME, VERSION, ...)
+# never leak into this script's namespace.
 detect_os() {
     if [ -f /etc/os-release ]; then
         # shellcheck disable=SC1091
         OS_ID="$(. /etc/os-release && printf '%s' "${ID:-}")"
         OS_VERSION_ID="$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")"
+        OS_CODENAME="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
         OS_PRETTY_NAME="$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-}")"
     fi
     OS_ARCH="$(uname -m)"
+    OS_KERNEL="$(uname -r)"
 }
 
 # Returns 0 if OS_ID/OS_VERSION_ID are a version this project actively
@@ -41,8 +49,9 @@ report_unsupported_os() {
     print_banner "UNSUPPORTED OPERATING SYSTEM"
     printf 'Detected: %s\n' "${OS_PRETTY_NAME:-unknown}"
     printf 'Distribution ID: %s\n' "${OS_ID:-unknown}"
-    printf 'Version: %s\n' "${OS_VERSION_ID:-unknown}"
-    printf 'Architecture: %s\n\n' "${OS_ARCH:-unknown}"
+    printf 'Version: %s (%s)\n' "${OS_VERSION_ID:-unknown}" "${OS_CODENAME:-unknown codename}"
+    printf 'Architecture: %s\n' "${OS_ARCH:-unknown}"
+    printf 'Kernel: %s\n\n' "${OS_KERNEL:-unknown}"
     printf 'This installer supports the following Ubuntu releases:\n'
     local v
     for v in "${M3U8_SUPPORTED_UBUNTU[@]}"; do
@@ -54,5 +63,6 @@ report_unsupported_os() {
 # Ensures required core prerequisites (curl, ca-certificates, gnupg) exist
 # before any package-specific logic runs. Safe to call multiple times.
 ensure_base_prerequisites() {
-    apt_install curl ca-certificates gnupg lsb-release
+    apt_install ca-certificates gnupg lsb-release
+    ensure_command curl curl || die "The curl package could not be installed (or its binary is still missing). Detected: ${OS_PRETTY_NAME:-unknown}."
 }

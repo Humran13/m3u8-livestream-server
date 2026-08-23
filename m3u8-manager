@@ -70,8 +70,9 @@ pick_stream() {
 # ---------------------------------------------------------------------------
 show_status() {
     print_banner "SERVER STATUS"
-    printf 'OS: %s\n' "${OS_PRETTY_NAME:-unknown}"
+    printf 'OS: %s (%s)\n' "${OS_PRETTY_NAME:-unknown}" "${OS_CODENAME:-unknown codename}"
     printf 'Hostname: %s\n' "$(hostname)"
+    detect_nginx_version && printf 'Nginx version: %s\n' "$NGINX_VERSION" || printf 'Nginx version: unknown\n'
     printf 'Nginx running: %s\n' "$(nginx_is_running && echo yes || echo no)"
     printf 'RTMP port %s listening: %s\n' "$M3U8_RTMP_PORT" "$(port_listening "$M3U8_RTMP_PORT" && echo yes || echo no)"
     printf 'HTTP port 80 listening: %s\n' "$(port_listening 80 && echo yes || echo no)"
@@ -300,18 +301,18 @@ ssl_menu() {
         5)
             if certificate_exists "$domain"; then
                 log_info "A certificate already exists for $domain."
-            else
-                install_certbot
-                if obtain_certificate "$domain" "$email"; then
-                    write_http_conf "$domain" "true" "$(cert_path_for "$domain")" "$(key_path_for "$domain")"
-                    if test_nginx; then
-                        systemctl reload nginx
-                        conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "true"
-                        sync_channels_json "$domain" "true"
-                        log_ok "SSL configured."
-                    else
-                        log_error "New SSL config failed validation; leaving current configuration in place."
-                    fi
+            fi
+            if certificate_exists "$domain" || (install_certbot && obtain_certificate "$domain" "$email"); then
+                local new_ssl_state
+                new_ssl_state="$(activate_site_config "$domain" "true" "$(cert_path_for "$domain")" "$(key_path_for "$domain")")"
+                conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "$new_ssl_state"
+                regenerate_streamkeys_map
+                sync_channels_json "$domain" "$new_ssl_state"
+                if [ "$new_ssl_state" = "true" ]; then
+                    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+                    log_ok "SSL configured."
+                else
+                    log_error "SSL configuration failed validation; the site remains on the last valid HTTP configuration (see output above)."
                 fi
             fi
             ;;

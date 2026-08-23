@@ -4,6 +4,22 @@ Run `sudo m3u8-manager` → **22. Server Diagnostics** (or `sudo m3u8-status`)
 first for almost every issue below - it checks most of these conditions
 automatically and tells you PASS/WARNING/FAIL for each.
 
+## The installer stopped partway through / crashed with an error
+
+`install.sh` is designed to be safe to run again. Just re-run:
+
+```bash
+sudo ./install.sh
+```
+
+It detects what already succeeded (Nginx installed, certificate issued,
+channel already created, etc.) and only does what's still needed - it will
+not create a duplicate channel, will not request a duplicate SSL
+certificate, and will not touch an existing channel's stream key. If the
+first run got Nginx and HLS working but failed later (for example, at
+firewall setup), that earlier work is preserved and the rerun picks up
+where it left off.
+
 ## OBS cannot connect
 
 - Confirm the **Server** field is exactly `rtmp://your-domain/live` (or your
