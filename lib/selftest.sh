@@ -328,6 +328,39 @@ run_relay_e2e_test() {
     fi
     _diag_pass "Relay systemd template installed"
 
+    if ! command_exists setpriv; then
+        _diag_fail "setpriv is not available; the relay runner cannot drop privileges."
+        return 1
+    fi
+    _diag_pass "setpriv available"
+
+    if ! id -u "$M3U8_RELAY_USER" >/dev/null 2>&1; then
+        _diag_fail "Dedicated relay user '$M3U8_RELAY_USER' does not exist."
+        return 1
+    fi
+    _diag_pass "Relay system user exists"
+
+    if [ ! -x "$M3U8_RELAY_RUNNER" ]; then
+        _diag_fail "Relay runner not installed or not executable ($M3U8_RELAY_RUNNER)."
+        return 1
+    fi
+    _diag_pass "Relay runner installed"
+
+    # This is the exact check that would have caught the real Ubuntu
+    # 24.04 bug: systemd sets up a unit's sandbox/mount namespace
+    # (including ReadWritePaths=) BEFORE ExecStart runs, so a missing
+    # relay HLS root fails the service immediately with a generic
+    # "226/NAMESPACE" - relay-runner.sh never gets a chance to mkdir it,
+    # because it never starts. ensure_relay_runtime_dirs repairs this
+    # unconditionally (it's idempotent/cheap), so the self-test never
+    # fails on this specific, fully-recoverable condition.
+    ensure_relay_runtime_dirs
+    if [ ! -d "$M3U8_RELAY_HLS_DIR" ]; then
+        _diag_fail "Relay HLS root ($M3U8_RELAY_HLS_DIR) could not be created."
+        return 1
+    fi
+    _diag_pass "Relay HLS root ready"
+
     # --- generate a tiny local test clip (one-time, bounded cost) --------
     _relay_e2e_tmpfile="$(mktemp --suffix=.mp4 2>/dev/null || mktemp)"
     if ! ffmpeg -hide_banner -loglevel error -y \

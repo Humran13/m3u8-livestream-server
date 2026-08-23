@@ -194,6 +194,45 @@ run_diagnostics() {
         _diag_warn "Relay systemd template not found ($M3U8_RELAY_SYSTEMD_TEMPLATE)."
     fi
 
+    # This specific check would have caught the real Ubuntu 24.04 bug
+    # where systemd's ReadWritePaths= target was missing: systemd sets up
+    # a unit's sandbox/mount namespace BEFORE ExecStart runs, so a
+    # missing relay HLS root fails every relay immediately
+    # ("226/NAMESPACE") before relay-runner.sh or FFmpeg ever executes.
+    if [ -d "$M3U8_RELAY_HLS_DIR" ]; then
+        local relay_hls_owner relay_hls_mode
+        relay_hls_owner="$(stat -c '%U:%G' "$M3U8_RELAY_HLS_DIR" 2>/dev/null || echo "")"
+        relay_hls_mode="$(stat -c '%a' "$M3U8_RELAY_HLS_DIR" 2>/dev/null || echo "")"
+        if [ "$relay_hls_owner" = "${M3U8_RELAY_USER}:${M3U8_RELAY_USER}" ] && [ "$relay_hls_mode" = "755" ]; then
+            _diag_pass "Relay HLS root exists (${M3U8_RELAY_USER}:${M3U8_RELAY_USER}/755)."
+        else
+            _diag_fail "Relay HLS root is ${relay_hls_owner:-unknown}/${relay_hls_mode:-unknown}, expected ${M3U8_RELAY_USER}:${M3U8_RELAY_USER}/755."
+        fi
+        # Uses setpriv, not sudo: Phase B already guarantees setpriv (via
+        # util-linux) as a real dependency, so this introduces nothing new
+        # - and it tests write access under the EXACT same privilege
+        # transition the real relay uses, which sudo would not. The test
+        # path is generated internally (this process's own PID, never
+        # user input); touch is a single safe argv command, never a
+        # constructed shell string.
+        if command_exists setpriv; then
+            local relay_test_file="${M3U8_RELAY_HLS_DIR}/.m3u8-server-write-test-$$"
+            if setpriv --reuid "$M3U8_RELAY_USER" --regid "$M3U8_RELAY_USER" \
+                --init-groups --inh-caps=-all --no-new-privs -- \
+                touch "$relay_test_file" 2>/dev/null; then
+                rm -f "$relay_test_file" 2>/dev/null || true
+                _diag_pass "Relay HLS root is writable by $M3U8_RELAY_USER."
+            else
+                rm -f "$relay_test_file" 2>/dev/null || true
+                _diag_fail "Relay HLS root is NOT writable by $M3U8_RELAY_USER; every relay will fail to start."
+            fi
+        else
+            _diag_warn "setpriv unavailable; could not verify HLS root write access as $M3U8_RELAY_USER directly."
+        fi
+    else
+        _diag_fail "Relay HLS root does not exist ($M3U8_RELAY_HLS_DIR). Every relay will fail at systemd sandbox setup until this is repaired - run 'sudo ./install.sh' again, or start/create any relay from the manager, either of which recreates it automatically."
+    fi
+
     local relay_count=0 relay_healthy=0 relay_failed=0 relay_stale=0 rname rstate
     for rname in $(list_relay_names 2>/dev/null || true); do
         relay_count=$((relay_count + 1))

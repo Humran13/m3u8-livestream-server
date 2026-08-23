@@ -92,6 +92,32 @@ ensure_relay_user() {
     log_ok "Created system user '$M3U8_RELAY_USER' for relay processes."
 }
 
+# ensure_relay_runtime_dirs
+# Verifies/creates the directories the relay subsystem depends on at
+# RUNTIME, not just at install time. This matters specifically because
+# systemd sets up a unit's sandbox/mount namespace (including
+# ReadWritePaths=) BEFORE ExecStart ever runs - if the relay HLS root is
+# missing at that moment, the service fails immediately
+# ("226/NAMESPACE"), and relay-runner.sh never even gets a chance to
+# mkdir it, because it never starts. Idempotent and cheap (ensure_dir is
+# a no-op if a directory already exists with the right mode/owner), so
+# it's safe to call before every single relay start rather than trusting
+# a one-time install-time assumption that nothing ever removes these
+# directories afterward (a partial uninstall, manual cleanup, or disk
+# tooling all could). Never touches existing relay configs, media
+# content, or HLS output - only ensures the directories themselves exist.
+ensure_relay_runtime_dirs() {
+    if [ ! -d "$M3U8_RELAY_HLS_DIR" ]; then
+        log_info "Relay HLS directory missing; recreating..."
+        ensure_dir "$M3U8_RELAY_HLS_DIR" 755 "${M3U8_RELAY_USER}:${M3U8_RELAY_USER}"
+        log_ok "Relay HLS runtime directory ready."
+    else
+        ensure_dir "$M3U8_RELAY_HLS_DIR" 755 "${M3U8_RELAY_USER}:${M3U8_RELAY_USER}"
+    fi
+    ensure_dir "$M3U8_RELAYS_DIR" 700 root:root
+    ensure_dir "$M3U8_MEDIA_DIR" 750 "root:${M3U8_RELAY_USER}"
+}
+
 # Installs everything the relay subsystem needs. Idempotent: safe on every
 # install/rerun, never touches an existing relay's config.
 install_relay_runtime() {
@@ -104,20 +130,12 @@ install_relay_runtime() {
 
     ensure_relay_user
 
-    # Persistent relay config is root:root/700/600 - deliberately NOT
-    # owned by the relay user. Only root (the manager) and the runner's
-    # own root-context bootstrap (see lib/relay-runner.sh) ever read it.
-    ensure_dir "$M3U8_RELAYS_DIR" 700 root:root
-
-    # HLS output is meant to be public, so it's owned by the unprivileged
-    # relay user directly (it writes it at runtime, Nginx reads it).
-    ensure_dir "$M3U8_RELAY_HLS_DIR" 755 "${M3U8_RELAY_USER}:${M3U8_RELAY_USER}"
-
-    # Media is imported/cached content, not a secret, but the relay
-    # process only ever needs to READ it - only root (via the manager's
-    # import/cache flow) writes here. root:relay-group/750 gives the
-    # relay user read access via the group bit without write access.
-    ensure_dir "$M3U8_MEDIA_DIR" 750 "root:${M3U8_RELAY_USER}"
+    # Persistent relay config (root:root/700/600), the relay HLS output
+    # root (m3u8-relay:m3u8-relay/755 - systemd's ReadWritePaths= for the
+    # relay unit REQUIRES this to already exist before any relay can ever
+    # start, since sandbox setup happens before ExecStart), and the media
+    # directory (root:relay-group/750) - see ensure_relay_runtime_dirs.
+    ensure_relay_runtime_dirs
 
     local restrict_suidsgid_line="" systemd_ver
     systemd_ver="$(detect_systemd_version 2>/dev/null || echo 0)"
@@ -298,10 +316,10 @@ add_relay() {
     is_valid_relay_source_url "$url" || die "Source URL/path looks invalid or unsafe."
     is_valid_rtsp_transport "$rtsp_transport" || die "Invalid RTSP transport: $rtsp_transport"
 
-    # root:root - deliberately never chowned to the relay user. This file
-    # can hold source-URL credentials/tokens; only root (this manager) and
-    # the runner's brief root-context bootstrap ever read it.
-    ensure_dir "$M3U8_RELAYS_DIR" 700 root:root
+    # Also (re-)ensures the relay HLS output root and media directory
+    # exist, not just the config directory - a relay created after those
+    # went missing for any reason must not fail at systemd sandbox setup.
+    ensure_relay_runtime_dirs
     {
         printf 'NAME="%s"\n' "$name"
         printf 'DISPLAY_NAME="%s"\n' "${display:-$name}"
@@ -321,6 +339,12 @@ add_relay() {
         systemctl enable "m3u8-relay@${name}.service" >/dev/null 2>&1 || true
     fi
     sync_relay_manifest || true
+
+    # A freshly created, enabled relay should actually be running now -
+    # AUTOSTART only controls whether it also comes up again after a
+    # reboot. Uses start_relay (not a raw systemctl call) so this goes
+    # through the same runtime-directory guard as every other start path.
+    start_relay "$name" 2>&1 || log_warn "Relay '$name' was created but failed to start; check: sudo m3u8-manager -> Relay Management -> View / Follow Relay Logs"
 }
 
 # remove_relay <name> <purge_hls>
@@ -360,6 +384,7 @@ set_relay_enabled() {
     conf_set "$(relay_file "$name")" ENABLED "$enabled"
     chmod 600 "$(relay_file "$name")"
     if [ "$enabled" = "true" ]; then
+        ensure_relay_runtime_dirs
         systemctl start "m3u8-relay@${name}.service" 2>&1 || log_warn "Relay '$name' enabled but failed to start; check the logs."
     else
         systemctl stop "m3u8-relay@${name}.service" 2>/dev/null || true
@@ -379,16 +404,27 @@ set_relay_source() {
     log_ok "Source updated for relay '$name'. Restart it for the change to take effect."
 }
 
-start_relay()   { systemctl start "m3u8-relay@${1}.service"; }
+# start_relay/restart_relay both ensure the relay runtime directories
+# exist immediately before asking systemd to start the unit - this is
+# the ONLY point that can fix a missing ReadWritePaths= target, since
+# systemd sets up the sandbox/mount namespace before ExecStart runs;
+# relay-runner.sh itself can never recover from that class of failure
+# because it never gets a chance to execute in the first place.
+start_relay() {
+    ensure_relay_runtime_dirs
+    systemctl start "m3u8-relay@${1}.service"
+}
 stop_relay()    { systemctl stop "m3u8-relay@${1}.service"; }
 restart_relay() {
+    ensure_relay_runtime_dirs
     # Clear this relay's own previous HLS output before restarting, so a
     # stopped/failed relay's stale playlist never gets served as if it
-    # were current. Only ever the exact per-relay subdirectory.
+    # were current. Only ever the exact per-relay subdirectory, and only
+    # when a real name was actually given.
     local name="$1" out_dir="${M3U8_RELAY_HLS_DIR}/${1}"
     case "$out_dir" in
         "${M3U8_RELAY_HLS_DIR}/"*)
-            [ -d "$out_dir" ] && rm -f "${out_dir}"/*.ts "${out_dir}"/index.m3u8 2>/dev/null || true
+            [ -n "$name" ] && [ -d "$out_dir" ] && rm -f "${out_dir}"/*.ts "${out_dir}"/index.m3u8 2>/dev/null || true
             ;;
     esac
     systemctl restart "m3u8-relay@${name}.service"
