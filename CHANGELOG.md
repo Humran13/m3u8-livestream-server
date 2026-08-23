@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Generated Nginx configuration now sets `map_hash_bucket_size 256;`
+  before the stream-key allow-list `map` block (in both the HTTP and SSL
+  site templates). Without it, `nginx -t` fails with "could not build
+  map_hash, you should increase map_hash_bucket_size" once a project-
+  generated 48-character stream key is present - confirmed on a real
+  Ubuntu 24.04.4 LTS / Nginx 1.24.0 install.
+- Every operation that regenerates the stream-key map (add/remove/enable/
+  disable/regenerate-key/restore/installer) is now transactional: the
+  candidate map is validated with `nginx -t` immediately after being
+  written, and automatically rolled back to the previous working map if
+  it fails - the invalid candidate is never left as the live on-disk
+  file. `m3u8-manager`'s Restore Configuration now also auto-rolls-back
+  the entire site/RTMP config to its pre-restore safety backup if the
+  restored files themselves fail validation.
+- `m3u8-manager` Server Status and Server Diagnostics now report Nginx
+  service state and Nginx configuration validity as two separate results,
+  including an explicit warning for the specific dangerous combination of
+  "process running" + "config on disk invalid" (previously only the
+  service state was surfaced in Server Status).
+
+### Added
+- `is_valid_stream_key` validation (8-128 characters, `A-Za-z0-9_-` only)
+  applied to every manually-entered stream key, in both `install.sh` and
+  `m3u8-manager`, plus a `key_in_use` check rejecting a manual key that
+  collides with another channel's key (which would otherwise produce a
+  duplicate, `nginx -t`-failing map entry). Automatically generated keys
+  are unaffected and remain 48 characters.
+
 - SSL configuration generation now detects the actually-installed Nginx
   version and emits the HTTP/2 syntax that version supports, instead of
   always using the standalone `http2 on;` directive (only valid on Nginx

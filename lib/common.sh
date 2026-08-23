@@ -157,6 +157,20 @@ is_valid_rtmp_app_name() {
     [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{1,31}$ ]]
 }
 
+# Stream keys are written verbatim into a generated Nginx map ("KEY 1;"),
+# so the character set is restricted to what can never break map/config
+# syntax (no quotes, semicolons, whitespace, or Nginx variable syntax) or
+# need escaping in a URL/shell context. The lower bound (8) rejects
+# obviously-weak manual input; the upper bound (128) keeps the resulting
+# map hash bucket size requirement predictable (see lib/nginx.sh, where
+# map_hash_bucket_size is sized to comfortably fit keys up to this length).
+# Project-generated keys are 48 lowercase-hex characters and are always
+# well inside this range.
+is_valid_stream_key() {
+    local key="$1"
+    [[ "$key" =~ ^[A-Za-z0-9_-]{8,128}$ ]]
+}
+
 # ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------

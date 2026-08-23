@@ -17,13 +17,35 @@ stream_exists() {
     [ -f "$(stream_file "$1")" ]
 }
 
+# Returns 0 if the given stream key is already assigned to any existing
+# channel. A manually-entered key that collides with another channel's key
+# would otherwise produce a duplicate Nginx map entry, which fails
+# `nginx -t` outright - reject it up front instead.
+key_in_use() {
+    local key="$1" file existing
+    [ -d "$M3U8_STREAMS_DIR" ] || return 1
+    for file in "$M3U8_STREAMS_DIR"/*.conf; do
+        [ -e "$file" ] || continue
+        existing="$(conf_get "$file" STREAM_KEY || echo "")"
+        [ -n "$existing" ] && [ "$existing" = "$key" ] && return 0
+    done
+    return 1
+}
+
 # Applies pending metadata changes to nginx: regenerate the map + manifest,
-# validate, and reload only if valid.
+# validate, and reload only if valid. regenerate_streamkeys_map is itself
+# transactional (it restores the previous working map on failure), so a
+# failure here never leaves an invalid map active - but it does mean the
+# metadata change that was just saved has NOT taken effect in the live
+# configuration, which is surfaced clearly here rather than silently
+# reported as success.
 apply_stream_changes() {
     local domain ssl_enabled
     domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN || echo "")"
     ssl_enabled="$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED || echo "false")"
-    regenerate_streamkeys_map
+    if ! regenerate_streamkeys_map; then
+        log_error "The channel change was saved, but could NOT be applied to the live Nginx configuration (see above). Nginx continues running with its previous, still-working configuration."
+    fi
     [ -n "$domain" ] && sync_channels_json "$domain" "$ssl_enabled"
     reload_nginx
 }
@@ -41,7 +63,8 @@ add_stream() {
     local name="$1" display_name="$2" key="$3" enabled="${4:-true}"
     is_valid_channel_name "$name" || die "Invalid channel name: $name"
     stream_exists "$name" && die "A channel named '$name' already exists."
-    [ -n "$key" ] || die "A stream key is required."
+    is_valid_stream_key "$key" || die "Stream key must be 8-128 characters using only letters, digits, - or _."
+    key_in_use "$key" && die "That stream key is already assigned to another channel. Choose a different key or use automatic generation."
 
     ensure_dir "$M3U8_STREAMS_DIR" 700 root:root
     {

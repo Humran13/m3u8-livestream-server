@@ -179,7 +179,11 @@ else
         if confirm "Automatically generate a secure stream key for '$CHANNEL_NAME'?" "y"; then
             STREAM_KEY_CHOICE="auto"
         else
-            STREAM_KEY_CHOICE="$(ask "Enter a stream key (letters/digits/-/_ only)" "")"
+            while :; do
+                STREAM_KEY_CHOICE="$(ask "Enter a stream key (8-128 chars: letters, digits, - or _)" "")"
+                is_valid_stream_key "$STREAM_KEY_CHOICE" && break
+                log_error "Stream key must be 8-128 characters using only letters, digits, - or _."
+            done
         fi
     fi
 fi
@@ -237,7 +241,7 @@ log_info "Generating and validating the Nginx site configuration..."
 SSL_ENABLED="$(activate_site_config "$DOMAIN" "$SSL_ENABLED" "$CERT_PATH" "$KEY_PATH")" \
     || die "Neither the SSL nor the HTTP Nginx configuration could be validated. See output above. The previous working configuration (if any) was not touched."
 conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "$SSL_ENABLED"
-regenerate_streamkeys_map
+regenerate_streamkeys_map || true
 
 systemctl enable nginx >/dev/null 2>&1 || true
 systemctl reload nginx 2>/dev/null || systemctl restart nginx
@@ -251,7 +255,7 @@ if [ "$SSL_ENABLED" = "false" ] && [ "$SSL_CHOICE" = "yes" ] && ! certificate_ex
     if install_certbot && obtain_certificate "$DOMAIN" "$EMAIL"; then
         SSL_ENABLED="$(activate_site_config "$DOMAIN" "true" "$(cert_path_for "$DOMAIN")" "$(key_path_for "$DOMAIN")")"
         conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "$SSL_ENABLED"
-        regenerate_streamkeys_map
+        regenerate_streamkeys_map || true
         systemctl reload nginx 2>/dev/null || systemctl restart nginx
         if [ "$SSL_ENABLED" = "true" ]; then
             log_ok "SSL enabled for $DOMAIN."

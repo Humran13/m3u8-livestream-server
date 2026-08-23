@@ -74,6 +74,11 @@ show_status() {
     printf 'Hostname: %s\n' "$(hostname)"
     detect_nginx_version && printf 'Nginx version: %s\n' "$NGINX_VERSION" || printf 'Nginx version: unknown\n'
     printf 'Nginx running: %s\n' "$(nginx_is_running && echo yes || echo no)"
+    if test_nginx >/dev/null 2>&1; then
+        printf 'Nginx configuration on disk: valid\n'
+    else
+        printf 'Nginx configuration on disk: INVALID (run option 12, Test Nginx Configuration, for details)\n'
+    fi
     printf 'RTMP port %s listening: %s\n' "$M3U8_RTMP_PORT" "$(port_listening "$M3U8_RTMP_PORT" && echo yes || echo no)"
     printf 'HTTP port 80 listening: %s\n' "$(port_listening 80 && echo yes || echo no)"
     printf 'HTTPS port 443 listening: %s\n' "$(port_listening 443 && echo yes || echo no)"
@@ -109,8 +114,18 @@ add_stream_menu() {
     if confirm "Automatically generate a secure stream key?" "y"; then
         key="$(generate_stream_key)"
     else
-        key="$(ask "Enter a stream key" "")"
-        [ -n "$key" ] || die "A stream key is required."
+        while :; do
+            key="$(ask "Enter a stream key (8-128 chars: letters, digits, - or _)" "")"
+            if ! is_valid_stream_key "$key"; then
+                log_error "Stream key must be 8-128 characters using only letters, digits, - or _."
+                continue
+            fi
+            if key_in_use "$key"; then
+                log_error "That stream key is already assigned to another channel."
+                continue
+            fi
+            break
+        done
     fi
     add_stream "$name" "$display" "$key" "true"
     printf '\nChannel:\n%s\n\n' "$name"
@@ -306,7 +321,7 @@ ssl_menu() {
                 local new_ssl_state
                 new_ssl_state="$(activate_site_config "$domain" "true" "$(cert_path_for "$domain")" "$(key_path_for "$domain")")"
                 conf_set "$M3U8_SERVER_CONF" SSL_ENABLED "$new_ssl_state"
-                regenerate_streamkeys_map
+                regenerate_streamkeys_map || true
                 sync_channels_json "$domain" "$new_ssl_state"
                 if [ "$new_ssl_state" = "true" ]; then
                     systemctl reload nginx 2>/dev/null || systemctl restart nginx
@@ -326,7 +341,7 @@ firewall_status_menu() {
 }
 
 backup_config_menu() {
-    print_banner "BACKUP CONFIGURATION"
+    print_banner "BACKUP CONFIGURATION" >&2
     local ts dest
     ts="$(date '+%Y%m%d%H%M%S')"
     ensure_dir "$M3U8_BACKUP_DIR" 700 root:root
@@ -339,6 +354,10 @@ backup_config_menu() {
         2>/dev/null || true
     chmod 600 "$dest"
     log_ok "Backup created: $dest"
+    # Printed to stdout (unlike the messages above) so a caller can do
+    # safety_backup="$(backup_config_menu)" to capture the path for a
+    # possible rollback, e.g. restore_config_menu below.
+    printf '%s' "$dest"
 }
 
 restore_config_menu() {
@@ -360,17 +379,40 @@ restore_config_menu() {
     [ -n "$file" ] || { log_error "Invalid selection."; return 0; }
     log_warn "Restoring will overwrite the current configuration in $M3U8_CONFIG_DIR and the generated nginx files."
     confirm "A safety backup of the CURRENT configuration will be made first. Continue?" "n" || { log_info "Cancelled."; return 0; }
-    backup_config_menu
+    local safety_backup domain ssl_enabled
+    safety_backup="$(backup_config_menu)"
+
     tar -xzf "$file" -C /
-    local domain ssl_enabled
     domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN 2>/dev/null || echo "")"
     ssl_enabled="$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED 2>/dev/null || echo "false")"
-    regenerate_streamkeys_map
+    regenerate_streamkeys_map || true
     [ -n "$domain" ] && sync_channels_json "$domain" "$ssl_enabled"
+
+    # A restored backup must never be trusted blindly: only reload if the
+    # restored site/RTMP files (extracted verbatim from the archive, not
+    # regenerated) actually pass `nginx -t`. If they don't, automatically
+    # roll back to the safety backup taken moments ago, rather than
+    # leaving an unvalidated foreign configuration on disk.
     if reload_nginx; then
         log_ok "Configuration restored and nginx reloaded."
+        return 0
+    fi
+
+    log_error "Restored configuration failed Nginx validation. Rolling back to the pre-restore configuration..."
+    if [ -z "$safety_backup" ] || [ ! -f "$safety_backup" ]; then
+        log_error "No safety backup path available; the previous working Nginx configuration is still the one actually running. Restore manually from $M3U8_BACKUP_DIR if needed."
+        return 1
+    fi
+
+    tar -xzf "$safety_backup" -C /
+    domain="$(conf_get "$M3U8_SERVER_CONF" DOMAIN 2>/dev/null || echo "")"
+    ssl_enabled="$(conf_get "$M3U8_SERVER_CONF" SSL_ENABLED 2>/dev/null || echo "false")"
+    regenerate_streamkeys_map || true
+    [ -n "$domain" ] && sync_channels_json "$domain" "$ssl_enabled"
+    if reload_nginx; then
+        log_ok "Rolled back successfully; the pre-restore configuration is active again."
     else
-        log_error "Restored configuration failed nginx validation. The previous working configuration is still active; review the restored files manually."
+        log_error "Rollback also failed validation. Manual intervention required. Safety backup is at: $safety_backup"
     fi
 }
 

@@ -5,6 +5,15 @@
 # sites-enabled, so it is loaded inside nginx's existing http {} block
 # without any changes to the main nginx.conf.
 
+# map_hash_bucket_size must be large enough to hold the longest stream key
+# plus Nginx's per-entry hash overhead. Project-generated keys are 48
+# characters; manually-entered keys are validated up to 128 characters
+# (see is_valid_stream_key in lib/common.sh) - 256 bytes gives comfortable
+# headroom for the full allowed range. This is an http-context-only
+# directive; it lives here (not in nginx.conf) because this whole file is
+# already loaded inside Nginx's http {} block via sites-enabled.
+map_hash_bucket_size 256;
+
 # Stream-key allow list, regenerated whenever a channel is added, removed,
 # enabled, disabled or its key is rotated. Unknown or disabled keys map to 0
 # and are rejected by the /auth endpoint below.

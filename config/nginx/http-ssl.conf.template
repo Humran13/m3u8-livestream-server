@@ -2,6 +2,15 @@
 # Regenerated automatically by lib/nginx.sh (SSL variant, used once a
 # Let's Encrypt certificate for __DOMAIN__ has been issued).
 
+# map_hash_bucket_size must be large enough to hold the longest stream key
+# plus Nginx's per-entry hash overhead. Project-generated keys are 48
+# characters; manually-entered keys are validated up to 128 characters
+# (see is_valid_stream_key in lib/common.sh) - 256 bytes gives comfortable
+# headroom for the full allowed range. This is an http-context-only
+# directive; it lives here (not in nginx.conf) because this whole file is
+# already loaded inside Nginx's http {} block via sites-enabled.
+map_hash_bucket_size 256;
+
 map $arg_name $m3u8_stream_allowed {
     default 0;
     include __STREAMKEYS_MAP__;

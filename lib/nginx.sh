@@ -164,11 +164,21 @@ write_http_conf() {
 # the caller should persist via conf_set), and returns non-zero only if
 # even the HTTP-only candidate fails validation.
 activate_site_config() {
-    local domain="$1" want_ssl="$2" cert_path="$3" key_path="$4" output
+    local domain="$1" want_ssl="$2" cert_path="$3" key_path="$4" output backup_site=""
+
+    # Snapshot whatever site config is currently on disk (if any) so it can
+    # be restored if every candidate below fails validation - the file this
+    # function writes to is the one Nginx actually reloads from, so it must
+    # never be left in a state worse than what was there before this call.
+    if [ -f "$M3U8_NGINX_SITE_FILE" ]; then
+        backup_site="$(mktemp "${M3U8_NGINX_SITE_FILE}.previous.XXXXXX")"
+        cp -a "$M3U8_NGINX_SITE_FILE" "$backup_site"
+    fi
 
     if [ "$want_ssl" = "true" ] && [ -n "$cert_path" ] && [ -f "$cert_path" ] && [ -f "$key_path" ]; then
         write_http_conf "$domain" "true" "$cert_path" "$key_path"
         if output="$(test_nginx)"; then
+            [ -n "$backup_site" ] && rm -f "$backup_site"
             printf 'true'
             return 0
         fi
@@ -179,36 +189,100 @@ activate_site_config() {
 
     write_http_conf "$domain" "false" "" ""
     if output="$(test_nginx)"; then
+        [ -n "$backup_site" ] && rm -f "$backup_site"
         printf 'false'
         return 0
     fi
 
     log_error "Generated HTTP configuration also failed Nginx validation."
     printf '%s\n' "$output" >&2
+    if [ -n "$backup_site" ]; then
+        mv -f "$backup_site" "$M3U8_NGINX_SITE_FILE"
+        log_error "Restored the previous working site configuration; it has not been reloaded (still the same file Nginx already has loaded)."
+    else
+        log_error "No previous site configuration existed to restore. The invalid candidate is left on disk at $M3U8_NGINX_SITE_FILE for inspection; Nginx has NOT been reloaded with it."
+    fi
     printf 'false'
     return 1
 }
 
-# Regenerates the stream-key allow list from every stream record on disk.
-# Only enabled channels resolve to "1"; everything else (disabled, unknown,
-# no key at all) falls through to the map's "default 0".
+# Builds the candidate map body (one "KEY 1;" line per enabled channel) on
+# stdout. Only enabled channels with a key resolve to "1"; everything else
+# (disabled, unknown, no key at all) falls through to the map's
+# "default 0". Defensive filtering here (valid character set, no
+# duplicates) protects against a hand-edited or restored-from-an-old-
+# backup stream file, even though normal code paths never produce such a
+# file in the first place.
+_build_streamkeys_map_body() {
+    local file key enabled
+    # Bash associative array to detect duplicate keys across channels.
+    local -A seen=()
+    [ -d "$M3U8_STREAMS_DIR" ] || return 0
+    for file in "$M3U8_STREAMS_DIR"/*.conf; do
+        [ -e "$file" ] || continue
+        enabled="$(conf_get "$file" ENABLED || echo "false")"
+        [ "$enabled" = "true" ] || continue
+        key="$(conf_get "$file" STREAM_KEY || echo "")"
+        [ -n "$key" ] || continue
+        if ! is_valid_stream_key "$key"; then
+            log_warn "Skipping channel '$(basename "$file" .conf)': its stored stream key contains characters that are no longer considered safe for the Nginx map."
+            continue
+        fi
+        if [ -n "${seen[$key]:-}" ]; then
+            log_warn "Skipping channel '$(basename "$file" .conf)': its stream key duplicates channel '${seen[$key]}'. Regenerate one of their keys."
+            continue
+        fi
+        seen[$key]="$(basename "$file" .conf)"
+        printf '    %s 1;\n' "$key"
+    done
+}
+
+# Regenerates the stream-key allow list transactionally: the candidate is
+# written to the real path (Nginx can only validate a `map { include ...; }`
+# target that exists at the exact configured path), immediately tested with
+# `nginx -t`, and rolled back to the previous working map if that test
+# fails - so a bad candidate is never left as the live on-disk map. Nginx
+# itself is not reloaded here (the caller does that once the whole site is
+# confirmed valid); this only guarantees the file on disk is always usable.
+# Returns 0 if the new map is active, 1 if it was rejected and the previous
+# map (or no map) was restored instead.
 regenerate_streamkeys_map() {
-    local tmp file name key enabled
+    local tmp previous_backup="" had_previous=0 output
     ensure_dir "$(dirname "$M3U8_STREAMKEYS_MAP")" 750 root:root
-    tmp="$(mktemp)"
-    if [ -d "$M3U8_STREAMS_DIR" ]; then
-        for file in "$M3U8_STREAMS_DIR"/*.conf; do
-            [ -e "$file" ] || continue
-            enabled="$(conf_get "$file" ENABLED || echo "false")"
-            key="$(conf_get "$file" STREAM_KEY || echo "")"
-            if [ "$enabled" = "true" ] && [ -n "$key" ]; then
-                printf '    %s 1;\n' "$key" >>"$tmp"
-            fi
-        done
+
+    tmp="$(mktemp "${M3U8_STREAMKEYS_MAP}.candidate.XXXXXX")"
+    _build_streamkeys_map_body >"$tmp"
+    chmod 600 "$tmp"
+
+    if [ -f "$M3U8_STREAMKEYS_MAP" ]; then
+        had_previous=1
+        previous_backup="$(mktemp "${M3U8_STREAMKEYS_MAP}.previous.XXXXXX")"
+        cp -a "$M3U8_STREAMKEYS_MAP" "$previous_backup"
     fi
+
     mv -f "$tmp" "$M3U8_STREAMKEYS_MAP"
     chmod 600 "$M3U8_STREAMKEYS_MAP"
     chown root:root "$M3U8_STREAMKEYS_MAP" 2>/dev/null || true
+
+    if output="$(test_nginx)"; then
+        [ -n "$previous_backup" ] && rm -f "$previous_backup"
+        return 0
+    fi
+
+    log_error "The regenerated stream-key configuration failed Nginx validation:"
+    printf '%s\n' "$output" >&2
+    if [ "$had_previous" -eq 1 ]; then
+        mv -f "$previous_backup" "$M3U8_STREAMKEYS_MAP"
+        chmod 600 "$M3U8_STREAMKEYS_MAP"
+        chown root:root "$M3U8_STREAMKEYS_MAP" 2>/dev/null || true
+        log_error "Restored the previous stream-key configuration."
+    else
+        rm -f "$M3U8_STREAMKEYS_MAP"
+        : >"$M3U8_STREAMKEYS_MAP"
+        chmod 600 "$M3U8_STREAMKEYS_MAP"
+        log_error "No previous stream-key configuration existed; left an empty (deny-all) map in place instead of the invalid candidate."
+    fi
+    return 1
 }
 
 # Regenerates the public channel manifest consumed by the web player. Only

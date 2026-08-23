@@ -35,17 +35,29 @@ run_diagnostics() {
         _diag_warn "Could not determine the installed Nginx version."
     fi
 
+    local nginx_running=0 nginx_config_valid=0
     if systemctl is-active --quiet nginx; then
+        nginx_running=1
         _diag_pass "Nginx service is running."
     else
         _diag_fail "Nginx service is not running. Run: sudo systemctl status nginx"
     fi
 
     if output="$(nginx -t 2>&1)"; then
-        _diag_pass "Nginx configuration is valid."
+        nginx_config_valid=1
+        _diag_pass "Nginx configuration on disk is valid."
     else
-        _diag_fail "Nginx configuration test failed."
+        _diag_fail "Nginx configuration on disk is invalid."
         printf '%s\n' "$output" | sed 's/^/          /'
+    fi
+
+    # This combination is the dangerous one this project has hit for
+    # real: Nginx is still serving traffic from whatever it last loaded
+    # successfully, but the config on disk cannot be reloaded or survive a
+    # restart until it's fixed. Never let "systemctl is-active" alone
+    # stand in for "everything is fine."
+    if [ "$nginx_running" -eq 1 ] && [ "$nginx_config_valid" -eq 0 ]; then
+        _diag_fail "Nginx is running, but the configuration currently on disk is invalid. Changes will not take effect, and a restart or reboot will bring Nginx down until this is fixed."
     fi
 
     if port_listening "$M3U8_RTMP_PORT"; then
