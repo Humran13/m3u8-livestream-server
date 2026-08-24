@@ -302,8 +302,15 @@ _relay_e2e_cleanup() {
     if [ -n "$_relay_e2e_name" ] && relay_exists "$_relay_e2e_name"; then
         remove_relay "$_relay_e2e_name" "true" >/dev/null 2>&1 || true
     fi
+    # Defense in depth: only ever remove the exact, internally generated
+    # temp file this run created, and only if it is provably inside the
+    # managed media directory - never $M3U8_MEDIA_DIR itself (a bare/
+    # trailing-slash value could otherwise match its own "/*" glob) and
+    # never anything outside it, no matter what _relay_e2e_tmpfile holds.
     if [ -n "$_relay_e2e_tmpfile" ] && [ -f "$_relay_e2e_tmpfile" ]; then
-        rm -f "$_relay_e2e_tmpfile"
+        case "$_relay_e2e_tmpfile" in
+            "${M3U8_MEDIA_DIR}/"?*) rm -f "$_relay_e2e_tmpfile" ;;
+        esac
     fi
     _relay_e2e_name=""
     _relay_e2e_tmpfile=""
@@ -362,7 +369,27 @@ run_relay_e2e_test() {
     _diag_pass "Relay HLS root ready"
 
     # --- generate a tiny local test clip (one-time, bounded cost) --------
-    _relay_e2e_tmpfile="$(mktemp --suffix=.mp4 2>/dev/null || mktemp)"
+    # This MUST live under the managed media directory, never host /tmp:
+    # the relay systemd unit runs with PrivateTmp=true, so a file created
+    # in the manager process's /tmp is invisible inside the relay's own
+    # private /tmp namespace - relay-runner.sh would report "local source
+    # file does not exist" even though the file is right there from this
+    # process's point of view. ensure_relay_runtime_dirs (above) already
+    # guarantees $M3U8_MEDIA_DIR exists as root:m3u8-relay/750; re-check
+    # explicitly anyway so a failure here produces a clear message instead
+    # of a confusing mktemp error.
+    if [ ! -d "$M3U8_MEDIA_DIR" ]; then
+        _diag_fail "Managed media directory does not exist ($M3U8_MEDIA_DIR)."
+        return 1
+    fi
+    # Template ends in a literal suffix (not X's), so mktemp treats
+    # everything after the X run as a fixed suffix - the actual filename
+    # is entirely internally generated, never user-controlled.
+    _relay_e2e_tmpfile="$(mktemp "${M3U8_MEDIA_DIR}/.selftest-relay-XXXXXXXX.mp4" 2>/dev/null || true)"
+    if [ -z "$_relay_e2e_tmpfile" ]; then
+        _diag_fail "Could not create a temporary test file in the managed media directory ($M3U8_MEDIA_DIR)."
+        return 1
+    fi
     if ! ffmpeg -hide_banner -loglevel error -y \
         -f lavfi -i "testsrc=size=320x240:rate=25:duration=5" \
         -f lavfi -i "sine=frequency=800:duration=5" \
@@ -372,8 +399,31 @@ run_relay_e2e_test() {
         _diag_fail "Could not generate the local test clip."
         return 1
     fi
-    chmod 644 "$_relay_e2e_tmpfile"
-    _diag_pass "Local test clip generated"
+    # root:m3u8-relay/640 - readable by the relay user via the group bit,
+    # not writable by it - the same ownership model cache_remote_media()
+    # uses for real cached source media. The media directory itself stays
+    # root:m3u8-relay/750 (never made writable by m3u8-relay).
+    chown "root:${M3U8_RELAY_USER}" "$_relay_e2e_tmpfile" 2>/dev/null || true
+    chmod 640 "$_relay_e2e_tmpfile"
+    _diag_pass "Local test clip generated in managed media directory"
+
+    if stat -c '%U:%G %a' "$_relay_e2e_tmpfile" >/dev/null 2>&1; then
+        _diag_pass "Test clip ownership/mode: $(stat -c '%U:%G %a' "$_relay_e2e_tmpfile")"
+    fi
+
+    # Prove the actual unprivileged relay account can read the file before
+    # ever asking systemd to start a service that depends on it - same
+    # privilege-transition primitive the real relay uses (setpriv, never
+    # sudo), run against a fixed, safe command (never eval / a shell
+    # string built from input).
+    if setpriv --reuid "$M3U8_RELAY_USER" --regid "$M3U8_RELAY_USER" \
+        --init-groups --inh-caps=-all --no-new-privs -- \
+        test -r "$_relay_e2e_tmpfile"; then
+        _diag_pass "Temporary test media readable by $M3U8_RELAY_USER"
+    else
+        _diag_fail "Temporary test media is NOT readable by $M3U8_RELAY_USER"
+        return 1
+    fi
 
     while :; do
         _relay_e2e_name="selftest-relay-$(openssl rand -hex 3 2>/dev/null || echo "$RANDOM")"
