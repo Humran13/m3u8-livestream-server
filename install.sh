@@ -370,7 +370,7 @@ if [ "$OPT_NONINTERACTIVE" -eq 0 ]; then
         fi
     fi
 else
-    log_info "Skipping the interactive self-tests in non-interactive mode. Run them later: sudo m3u8-manager -> options 26/28."
+    log_info "Skipping the interactive self-tests in non-interactive mode. Run them later: sudo m3u8-manager -> option 26 (streaming test), and option 27 -> Relay Management -> option 16 (relay test)."
 fi
 
 # ---------------------------------------------------------------------------

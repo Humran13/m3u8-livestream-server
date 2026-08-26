@@ -27,7 +27,7 @@ channel.
 - Non-interactive/scriptable install via flags or environment variables
 - Multiple stream/channel management, no manual Nginx editing required
 - Cryptographically random, unique stream keys (never predictable defaults)
-- Interactive `m3u8-manager` administration menu (24 functions)
+- Interactive `m3u8-manager` administration menu (27 functions)
 - Reliable HLS output with sane defaults (segment length, cleanup, CORS)
 - Lightweight `hls.js` web player with native-HLS fallback and auto-retry
 - Let's Encrypt / Certbot SSL support with DNS pre-checks
@@ -385,7 +385,7 @@ the installer contains logic for it.
 | 18.04  | Yes                | No                |
 | 20.04  | Yes                | No                |
 | 22.04  | Yes                | No                |
-| 24.04  | Yes                | Phase A passed; Phase B pending - see below |
+| 24.04  | Yes                | Phase A passed; Phase B relay self-test passed |
 | 26.04  | Yes                | No                |
 
 ## Testing status
@@ -428,10 +428,14 @@ config, reuses the existing certificate without requesting a new one,
 installs `ufw` if it's genuinely missing, and leaves any already-created
 channel and its stream key untouched.
 
-**Phase B (24/7 source relay) is brand new and has NOT been tested on a
-real VPS yet** - only statically reviewed and syntax-checked, same as
-everything above was before its own real test. Do not rely on relay mode
-in production until that testing has happened.
+**Phase B (24/7 source relay) has passed its end-to-end self-test on a
+real Ubuntu 24.04 VPS** - FFmpeg was confirmed running as the
+unprivileged m3u8-relay user, HLS playlist and segments were generated,
+the public relay URL was retrievable, and ffprobe confirmed the relay
+output was decodable. Only the local-file relay path has been validated
+so far; remote HLS/RTMP/RTMPS/RTSP/HTTP sources and relaying a real
+high-bitrate 1080p file have not yet been exercised on a live VPS. Do
+not rely on those untested source types in production until validated.
 
 Beyond the specific items above, this has not yet been confirmed as a
 full, clean end-to-end pass of every feature (second channel,
